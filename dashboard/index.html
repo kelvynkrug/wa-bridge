@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wa-bridge · painel</title>
+<link rel="stylesheet" href="style.css">
+<link id="favicon" rel="icon" href="data:,">
+</head>
+<body>
+
+<!-- Tela de token: fica oculta via classe "hidden" quando há token salvo -->
+<div id="auth-screen" class="auth-screen hidden">
+  <div class="auth-card">
+    <div class="auth-logo">◈</div>
+    <h1>wa-bridge</h1>
+    <p id="auth-account" class="account-pill account-pill-lg hidden"></p>
+    <p class="auth-sub">Painel de métricas — acesso local, protegido por token.</p>
+    <label for="token-input" class="auth-label">Bearer token</label>
+    <input id="token-input" type="password" autocomplete="off" placeholder="cole o token aqui">
+    <button id="token-submit" class="btn btn-primary">Entrar</button>
+    <p id="auth-error" class="auth-error hidden"></p>
+    <div class="auth-hint">
+      <p>O token desta instância fica em <code id="auth-token-path">~/.wa-bridge/token</code>, gerado no primeiro boot do daemon.</p>
+      <p>Para ver: <code id="auth-token-cmd">cat ~/.wa-bridge/token</code></p>
+      <p class="auth-hint-muted">Cada número tem o próprio daemon e o próprio token.</p>
+      <p class="auth-hint-muted">Fica salvo só neste navegador (localStorage), nunca saiu daqui.</p>
+    </div>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
+
+  <header class="topbar">
+    <div class="topbar-brand">
+      <span class="brand-mark">◈</span>
+      <span class="brand-name">wa-bridge</span>
+      <span class="brand-sep">/</span>
+      <span class="brand-sub">painel</span>
+      <span id="brand-account" class="account-pill hidden"></span>
+    </div>
+
+    <div class="topbar-controls">
+      <div class="window-select" role="group" aria-label="Janela de tempo">
+        <button data-window="3600000" class="window-btn">1h</button>
+        <button data-window="86400000" class="window-btn is-active">24h</button>
+        <button data-window="604800000" class="window-btn">7d</button>
+        <button data-window="2592000000" class="window-btn">30d</button>
+      </div>
+
+      <button id="pause-toggle" class="btn btn-ghost" aria-pressed="false">
+        <span class="pause-icon">⏸</span><span class="pause-label">pausar</span>
+      </button>
+
+      <span id="refresh-indicator" class="refresh-indicator">atualizado agora</span>
+
+      <button id="change-token" class="btn btn-ghost btn-subtle" title="Trocar token">⚿</button>
+    </div>
+  </header>
+
+  <div id="connection-banner" class="banner banner-error hidden"></div>
+
+  <main class="main">
+
+    <!-- Status da sessão -->
+    <section class="session-bar" id="session-bar">
+      <div class="session-state">
+        <span id="session-dot" class="status-dot"></span>
+        <span id="session-state-label" class="session-state-label">—</span>
+      </div>
+      <div class="session-meta">
+        <span id="session-number" class="session-number">—</span>
+        <span id="session-since" class="session-since"></span>
+      </div>
+      <div id="session-error" class="session-error hidden"></div>
+    </section>
+
+    <section id="qr-pairing" class="qr-pairing hidden">
+      <div class="qr-card">
+        <p class="qr-title">Pareie o WhatsApp</p>
+        <img id="qr-image" alt="QR Code de pareamento do WhatsApp" />
+        <p class="qr-hint">Abra o WhatsApp no celular → Aparelhos conectados → Conectar um aparelho.</p>
+      </div>
+    </section>
+
+    <!-- KPIs -->
+    <section class="kpi-grid" id="kpi-grid" aria-label="Indicadores agregados"></section>
+
+    <!-- Timeline -->
+    <section class="panel" id="panel-timeline">
+      <div class="panel-head">
+        <h2>Timeline</h2>
+        <div class="legend">
+          <span class="legend-item"><i class="legend-swatch sw-calls"></i>chamadas</span>
+          <span class="legend-item"><i class="legend-swatch sw-sends"></i>envios</span>
+          <span class="legend-item"><i class="legend-swatch sw-errors"></i>erros</span>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div id="timeline-chart" class="chart-wrap"></div>
+        <div id="timeline-empty" class="empty-state hidden">
+          <p>Nenhuma atividade registrada nesta janela.</p>
+          <p class="empty-sub">Quando um agente chamar uma tool do wa-bridge, os buckets de tempo aparecem aqui.</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="two-col">
+      <!-- Por agente -->
+      <section class="panel" id="panel-byagent">
+        <div class="panel-head">
+          <h2>Uso por agente</h2>
+          <span class="panel-sub">quem domina o uso do WhatsApp</span>
+        </div>
+        <div class="panel-body">
+          <div id="byagent-list" class="agent-list"></div>
+          <div id="byagent-empty" class="empty-state hidden">
+            <p>Nenhum agente chamou o wa-bridge ainda nesta janela.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Por tool -->
+      <section class="panel" id="panel-bytool">
+        <div class="panel-head">
+          <h2>Uso por tool</h2>
+          <span class="panel-sub">chamadas, erros e p95</span>
+        </div>
+        <div class="panel-body">
+          <div class="table-scroll">
+            <table class="data-table" id="bytool-table">
+              <thead>
+                <tr><th>tool</th><th class="num">calls</th><th class="num">erros</th><th class="num">p95</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div id="bytool-empty" class="empty-state hidden">
+            <p>Nenhuma tool chamada ainda nesta janela.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="two-col">
+      <!-- Auditoria -->
+      <section class="panel" id="panel-audit">
+        <div class="panel-head">
+          <h2>Trilha de auditoria</h2>
+          <span class="panel-sub">últimos eventos de envio e sessão</span>
+        </div>
+        <div class="panel-body">
+          <ul id="audit-list" class="audit-list"></ul>
+          <div id="audit-empty" class="empty-state hidden">
+            <p>Nenhum evento de auditoria ainda.</p>
+            <p class="empty-sub">Envios, bloqueios e pareamentos aparecem aqui conforme acontecem.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Últimas chamadas -->
+      <section class="panel" id="panel-calls">
+        <div class="panel-head">
+          <h2>Últimas chamadas</h2>
+          <span class="panel-sub">tool calls recentes, com duração e status</span>
+        </div>
+        <div class="panel-body">
+          <div class="table-scroll">
+            <table class="data-table" id="calls-table">
+              <thead>
+                <tr><th>hora</th><th>agente</th><th>tool</th><th class="num">duração</th><th>status</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div id="calls-empty" class="empty-state hidden">
+            <p>Nenhuma chamada registrada ainda.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+
+  </main>
+
+  <footer class="footer">
+    <span>wa-bridge dashboard · dados locais, sem telemetria</span>
+    <span id="mock-badge" class="mock-badge hidden">modo mock</span>
+  </footer>
+
+</div>
+
+<script src="mock-data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

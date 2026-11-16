@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+#
+# wa-bridge — instala e controla o daemon (sem Docker).
+#
+#   ./wa-bridge setup [--model NOME | --no-model]   instala deps, builda e baixa o modelo
+#   ./wa-bridge start|stop|restart|status|logs       ciclo de vida do daemon
+#   ./wa-bridge open                                 abre o painel já autenticado
+#   ./wa-bridge qr                                   salva e abre o QR de pareamento (PNG)
+#   ./wa-bridge pair [--yes]                         descarta a sessão e gera QR novo
+#   ./wa-bridge mcp-config                           imprime a config MCP de cada agente
+#   ./wa-bridge token|doctor
+#
+# Mantém UMA instância por WA_BRIDGE_HOME: duas sessões Baileys com a mesma credencial
+# derrubam a conta do WhatsApp com `device_removed` e exigem novo pareamento. Por isso
+# todo `start` checa se já há daemon de pé (pidfile OU porta ocupada) antes de subir.
+#
+# Variáveis podem vir do ambiente ou de um `.env` na raiz do repo (ver .env.example).
+# O ambiente sempre ganha do `.env`: `WA_BRIDGE_PORT=7789 ./wa-bridge start` funciona
+# mesmo com outra porta no arquivo.
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Carrega `.env` sem sobrescrever o que já veio do ambiente. Não usamos `source` porque
+# ele executaria o arquivo como shell e sobrescreveria variáveis já definidas.
+load_dotenv() {
+  local file="$REPO_DIR/.env" line key value
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+    key="${line%%=*}"; value="${line#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value%%[[:space:]]#*}"                     # comentário no fim da linha
+    value="${value%"${value##*[![:space:]]}"}"          # espaços no fim
+    value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+    value="${value/#\~/$HOME}"
+    [[ -n "${!key+x}" || -z "$value" ]] && continue
+    export "$key=$value"
+  done <"$file"
+}
+load_dotenv
+
+HOME_DIR="${WA_BRIDGE_HOME:-$HOME/.wa-bridge}"
+HOME_DIR="${HOME_DIR/#\~/$HOME}"
+export WA_BRIDGE_HOME="$HOME_DIR"
+PORT="${WA_BRIDGE_PORT:-7788}"
+PID_FILE="$HOME_DIR/daemon.pid"
+LOG_FILE="$HOME_DIR/logs/daemon.log"
+OUT_FILE="$HOME_DIR/logs/stdout.log"
+URL="http://127.0.0.1:$PORT"
+DEFAULT_MODEL_NAME="large-v3-turbo"
+MODEL_BASE_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+
+# shellcheck source=./bin/resolve-node.sh
+source "$REPO_DIR/bin/resolve-node.sh"
+
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+ok()    { printf '\033[32m✓\033[0m %s\n' "$*"; }
+warn()  { printf '\033[33m!\033[0m %s\n' "$*"; }
+fail()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
+
+is_macos() { [[ "$(uname -s)" == "Darwin" ]]; }
+
+mkdir -p "$HOME_DIR/logs"
+
+# Node >= 24 (o daemon usa `node:sqlite` nativo). Resolve sem depender do PATH, para
+# funcionar também em launchd/systemd e em clientes MCP de interface gráfica.
+node_bin() { WA_NODE_MIN_MAJOR=24 resolve_node; }
+
+# npm que acompanha o node escolhido (evita usar um npm de outra versão do PATH).
+run_npm() {
+  local node; node="$(node_bin)" || return 1
+  PATH="$(dirname "$node"):$PATH" npm "$@"
+}
+
+open_url() {
+  if is_macos; then open "$1"
+  elif command -v xdg-open >/dev/null; then xdg-open "$1" >/dev/null 2>&1 &
+  else echo "   abra no navegador: $1"
+  fi
+}
+
+file_mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null || echo '---'; }
+
+read_token() { [[ -f "$HOME_DIR/token" ]] && tr -d '\n' <"$HOME_DIR/token"; }
+
+# PID do daemon, se vivo. Vazio se não houver.
+running_pid() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "$pid"
+      return
+    fi
+  fi
+  # Pidfile ausente ou obsoleto: confere quem ocupa a porta.
+  if command -v lsof >/dev/null; then
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true
+  fi
+}
+
+health_json() { curl -fsS -m 5 "$URL/health" 2>/dev/null || true; }
+
+# Estado da sessão a partir do /health. O primeiro "state" do JSON é o da sessão.
+session_state() {
+  local json; json="$(health_json)"
+  [[ -z "$json" ]] && { echo "offline"; return; }
+  local state
+  state="$(printf '%s' "$json" | grep -o '"state":"[a-z]*"' | head -1 | cut -d'"' -f4)"
+  echo "${state:-desconhecido}"
+}
+
+# Container do wa-bridge de pé? Subir o daemon nativo junto usaria a MESMA credencial
+# em ~/.wa-bridge/auth, e duas sessões Baileys simultâneas derrubam a conta do WhatsApp
+# com `device_removed`, exigindo novo pareamento. Esta trava evita o acidente.
+docker_container_running() {
+  command -v docker >/dev/null || return 1
+  docker ps --filter "name=^wa-bridge$" --filter "status=running" --format '{{.Names}}' 2>/dev/null \
+    | grep -q . || return 1
+}
+
+# ------------------------------------------------------------------- setup
+
+cmd_setup() {
+  local model_name="${WHISPER_MODEL_NAME:-$DEFAULT_MODEL_NAME}" skip_model=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model) model_name="${2:?--model precisa de um nome (ex.: small, base, large-v3-turbo)}"; shift 2 ;;
+      --no-model) skip_model=1; shift ;;
+      *) fail "opção desconhecida: $1"; return 1 ;;
+    esac
+  done
+
+  bold "1/5 · verificando pré-requisitos"
+  local node
+  if ! node="$(node_bin)"; then
+    fail "Node 24 ou mais novo é obrigatório."
+    if is_macos; then echo "   instale com: brew install node   (ou: nvm install 24)"
+    else echo "   instale com nvm (https://github.com/nvm-sh/nvm): nvm install 24"; fi
+    return 1
+  fi
+  ok "node $("$node" -v) em $node"
+
+  local missing_ffmpeg=0 missing_whisper=0
+  command -v "${FFMPEG_BIN:-ffmpeg}" >/dev/null && ok "ffmpeg presente" || missing_ffmpeg=1
+  command -v "${WHISPER_BIN:-whisper-cli}" >/dev/null && ok "whisper-cli presente" || missing_whisper=1
+  if (( missing_ffmpeg || missing_whisper )); then
+    if is_macos; then
+      warn "faltando: $( ((missing_ffmpeg)) && printf 'ffmpeg ')$( ((missing_whisper)) && printf 'whisper-cli')"
+      echo "   instale com: brew install ffmpeg whisper-cpp"
+    else
+      ((missing_ffmpeg)) && { warn "ffmpeg ausente"; echo "   instale com: sudo apt install ffmpeg   (ou o gerenciador da sua distro)"; }
+      ((missing_whisper)) && { warn "whisper-cli ausente"; echo "   compile o whisper.cpp (https://github.com/ggml-org/whisper.cpp) e ponha o whisper-cli no PATH,"; echo "   ou defina WHISPER_BIN no .env. Também dá para rodar via Docker (ver docs/OPERACAO.md)."; }
+    fi
+    echo "   Sem eles o resto funciona, mas áudio e vídeo não são transcritos. Rode o setup de novo depois de instalar."
+  fi
+
+  bold "2/5 · instalando dependências"
+  (cd "$REPO_DIR" && run_npm ci --no-audit --no-fund)
+  ok "dependências instaladas"
+
+  bold "3/5 · compilando"
+  (cd "$REPO_DIR" && run_npm run build)
+  ok "build pronto (daemon/dist e mcp/dist)"
+
+  bold "4/5 · modelo de transcrição"
+  local model_path="${WHISPER_MODEL:-$HOME_DIR/models/ggml-$model_name.bin}"
+  model_path="${model_path/#\~/$HOME}"
+  if [[ -f "$model_path" ]]; then
+    ok "modelo já existe: $model_path"
+  elif (( skip_model )); then
+    warn "download do modelo pulado (--no-model); áudio não será transcrito até existir $model_path"
+  else
+    mkdir -p "$(dirname "$model_path")"
+    echo "   baixando ggml-$model_name.bin (large-v3-turbo ≈ 1,6 GB; small ≈ 470 MB; base ≈ 140 MB)..."
+    if curl -fL --retry 3 -C - -o "$model_path.part" "$MODEL_BASE_URL/ggml-$model_name.bin"; then
+      mv "$model_path.part" "$model_path"
+      ok "modelo salvo em $model_path"
+    else
+      fail "falha ao baixar o modelo. Tente de novo (o download continua de onde parou) ou use --model small."
+      return 1
+    fi
+  fi
+  # Modelo fora do padrão precisa chegar ao daemon: grava no .env, que o script lê no start.
+  if [[ "$model_path" != "$HOME_DIR/models/ggml-$DEFAULT_MODEL_NAME.bin" && -z "${WHISPER_MODEL:-}" ]]; then
+    printf '\nWHISPER_MODEL=%s\n' "$model_path" >>"$REPO_DIR/.env"
+    ok "WHISPER_MODEL gravado em .env"
+  fi
+
+  bold "5/5 · pronto"
+  echo
+  echo "Próximos passos:"
+  echo "  1. ./wa-bridge start        sobe o daemon"
+  echo "  2. ./wa-bridge open         abre o painel; no celular: WhatsApp > Aparelhos conectados > Conectar aparelho"
+  echo "  3. ./wa-bridge mcp-config   mostra o comando para plugar no seu agente (Claude Code, Codex, opencode...)"
+  echo
+}
+
+# ------------------------------------------------------------ ciclo de vida
+
+cmd_start() {
+  if docker_container_running; then
+    fail "há um container wa-bridge rodando — não suba o daemon nativo junto."
+    echo "   As duas instâncias dividiriam ~/.wa-bridge/auth e o WhatsApp derrubaria a sessão."
+    echo "   Escolha um: 'npm run docker:stop' para usar o nativo, ou use só o Docker."
+    return 1
+  fi
+
+  local pid; pid="$(running_pid)"
+  if [[ -n "$pid" ]]; then
+    warn "daemon já está rodando (pid $pid) — nada a fazer"
+    cmd_status
+    return 0
+  fi
+
+  if [[ ! -d "$REPO_DIR/node_modules" ]]; then
+    fail "dependências não instaladas — rode primeiro: ./wa-bridge setup"
+    return 1
+  fi
+
+  bold "subindo o wa-bridge..."
+  cd "$REPO_DIR"
+
+  local node; node="$(node_bin)" || return 1
+
+  if [[ -f "$REPO_DIR/daemon/dist/index.js" ]]; then
+    # Preferimos o build: não depende de `npx`/`tsx` estarem no PATH.
+    nohup "$node" "$REPO_DIR/daemon/dist/index.js" >>"$OUT_FILE" 2>&1 &
+  else
+    # Sem build, cai para o fonte via tsx. `tsx` sem watch: um daemon não deve
+    # reiniciar sozinho a cada arquivo salvo.
+    warn "daemon/dist ausente — rodando do fonte (rode './wa-bridge setup' para o modo estável)"
+    nohup "$node" "$REPO_DIR/node_modules/.bin/tsx" daemon/src/index.ts >>"$OUT_FILE" 2>&1 &
+  fi
+  echo $! >"$PID_FILE"
+
+  for _ in $(seq 1 40); do
+    sleep 0.5
+    if [[ -n "$(health_json)" ]]; then
+      ok "daemon no ar (pid $(cat "$PID_FILE"))"
+      cmd_status
+      return 0
+    fi
+  done
+
+  fail "o daemon não respondeu em 20s — veja: ./wa-bridge logs"
+  tail -20 "$OUT_FILE" >&2 || true
+  return 1
+}
+
+cmd_stop() {
+  local pid; pid="$(running_pid)"
+  if [[ -z "$pid" ]]; then
+    warn "daemon já está parado"
+    rm -f "$PID_FILE"
+    return 0
+  fi
+  bold "parando o daemon (pid $pid)..."
+  # SIGTERM primeiro: o index.ts fecha a API e a sessão de forma limpa.
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    sleep 0.5
+    kill -0 "$pid" 2>/dev/null || { rm -f "$PID_FILE"; ok "parado"; return 0; }
+  done
+  warn "não encerrou em 10s, forçando..."
+  kill -KILL "$pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+  ok "parado (forçado)"
+}
+
+cmd_restart() { cmd_stop; sleep 1; cmd_start; }
+
+cmd_status() {
+  local pid state; pid="$(running_pid)"; state="$(session_state)"
+  echo
+  bold "wa-bridge ($HOME_DIR, porta $PORT)"
+  if [[ -n "$pid" ]]; then ok "processo: rodando (pid $pid)"; else fail "processo: parado"; fi
+  case "$state" in
+    open)       ok "whatsapp: conectado" ;;
+    pairing)    warn "whatsapp: aguardando pareamento — rode './wa-bridge open' e escaneie o QR" ;;
+    connecting) warn "whatsapp: conectando..." ;;
+    offline)    fail "whatsapp: daemon não responde em $URL" ;;
+    *)          warn "whatsapp: $state" ;;
+  esac
+  echo "   painel: $URL/dashboard/"
+  echo "   logs:   $LOG_FILE"
+  echo
+}
+
+cmd_logs() { tail -f "$LOG_FILE" "$OUT_FILE"; }
+
+# ---------------------------------------------------------------- pareamento
+
+cmd_pair() {
+  local yes=0
+  [[ "${1:-}" == "--yes" ]] && yes=1
+  warn "isto DESCARTA a sessão atual do WhatsApp e exige escanear um QR novo."
+  if (( ! yes )); then
+    if [[ ! -t 0 ]]; then fail "sem terminal interativo: confirme com './wa-bridge pair --yes'"; return 1; fi
+    read -r -p "confirma? [s/N] " answer
+    [[ "$answer" == "s" || "$answer" == "S" ]] || { echo "cancelado"; return 0; }
+  fi
+  # Backup antes: credencial pareada é cara de recuperar.
+  if [[ -d "$HOME_DIR/auth" ]] && [[ -n "$(ls -A "$HOME_DIR/auth" 2>/dev/null)" ]]; then
+    local backup; backup="$HOME_DIR/auth.backup-$(date +%Y%m%d-%H%M%S)"
+    cp -R "$HOME_DIR/auth" "$backup"
+    ok "backup da credencial atual em $backup"
+  fi
+  if [[ -n "$(health_json)" ]]; then
+    # Daemon de pé: ele mesmo apaga a credencial e gera o QR, sem reiniciar o processo.
+    curl -fsS -m 10 -X POST -H "Authorization: Bearer $(read_token)" "$URL/session/pair" >/dev/null
+  else
+    rm -rf "$HOME_DIR/auth"
+    cmd_start
+  fi
+  ok "novo pareamento iniciado — rode './wa-bridge open' (ou './wa-bridge qr') e escaneie"
+}
+
+# Salva o QR atual como PNG e abre. O QR troca a cada ~20s: se expirar, rode de novo.
+cmd_qr() {
+  local token; token="$(read_token)" || { fail "token não existe — suba o daemon: ./wa-bridge start"; return 1; }
+  local node; node="$(node_bin)" || return 1
+  local out="$HOME_DIR/qr.png" session
+  session="$(curl -fsS -m 5 -H "Authorization: Bearer $token" "$URL/session" 2>/dev/null)" \
+    || { fail "daemon não responde em $URL — rode: ./wa-bridge start"; return 1; }
+  if ! printf '%s' "$session" | "$node" -e '
+      let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+        const j = JSON.parse(s);
+        if (j.state === "open") { console.error("já conectado — nada a parear"); process.exit(2); }
+        if (!j.qrDataUrl) { console.error("QR ainda não gerado (estado: " + j.state + ") — tente em alguns segundos"); process.exit(3); }
+        require("fs").writeFileSync(process.argv[1], Buffer.from(j.qrDataUrl.split(",")[1], "base64"));
+      });' "$out"; then
+    return 1
+  fi
+  ok "QR salvo em $out — escaneie em WhatsApp > Aparelhos conectados > Conectar aparelho"
+  open_url "$out"
+}
+
+cmd_open() {
+  [[ -n "$(health_json)" ]] || { fail "daemon não está no ar — rode: ./wa-bridge start"; return 1; }
+  local token; token="$(read_token || true)"
+  # O token vai no fragmento (#), que o navegador nunca envia ao servidor; o painel o
+  # guarda e limpa da barra de endereço. A barra final em /dashboard/ importa.
+  open_url "$URL/dashboard/${token:+#token=$token}"
+  ok "painel aberto"
+}
+
+cmd_token() {
+  local token_path="$HOME_DIR/token"
+  [[ -f "$token_path" ]] || { fail "token não existe ainda — suba o daemon uma vez"; return 1; }
+  if command -v pbcopy >/dev/null; then
+    tr -d '\n' <"$token_path" | pbcopy
+    ok "token copiado para a área de transferência — cole no painel"
+  else
+    cat "$token_path"
+  fi
+}
+
+# ------------------------------------------------------------ integração MCP
+
+cmd_mcp_config() {
+  local name="${WA_MCP_NAME:-whatsapp}" wrapper="$REPO_DIR/bin/wa-bridge-mcp"
+  local default_home="$HOME/.wa-bridge" extra_env="" extra_toml="" extra_json="" extra_oc=""
+  if [[ "$HOME_DIR" != "$default_home" ]]; then
+    extra_env=" \\
+  -e WA_BRIDGE_HOME=$HOME_DIR"
+    extra_toml=$'\n'"WA_BRIDGE_HOME = \"$HOME_DIR\""
+    extra_json=",
+        \"WA_BRIDGE_HOME\": \"$HOME_DIR\""
+    extra_oc=" \\
+  --env WA_BRIDGE_HOME=$HOME_DIR"
+  fi
+  [[ -f "$REPO_DIR/mcp/dist/index.js" ]] || warn "mcp/dist ainda não existe — rode './wa-bridge setup' antes de usar a config abaixo"
+
+  cat <<EOF
+
+Nome do servidor MCP: "$name" (troque com WA_MCP_NAME=outro ./wa-bridge mcp-config)
+Daemon: $URL · estado em $HOME_DIR
+
+── Claude Code ───────────────────────────────────────────────
+claude mcp add $name --scope user \\
+  -e WA_AGENT_NAME=claude-code \\
+  -e WA_BRIDGE_URL=$URL$extra_env \\
+  -- $wrapper
+
+── Codex (~/.codex/config.toml) ──────────────────────────────
+[mcp_servers.$name]
+command = "$wrapper"
+args = []
+startup_timeout_sec = 30
+
+[mcp_servers.$name.env]
+WA_AGENT_NAME = "codex"
+WA_BRIDGE_URL = "$URL"$extra_toml
+
+── opencode ──────────────────────────────────────────────────
+opencode mcp add --global $name \\
+  --env WA_AGENT_NAME=opencode \\
+  --env WA_BRIDGE_URL=$URL$extra_oc \\
+  -- $wrapper
+
+── Qualquer cliente com JSON "mcpServers" (Cursor, Claude Desktop, ...) ──
+{
+  "mcpServers": {
+    "$name": {
+      "command": "$wrapper",
+      "args": [],
+      "env": {
+        "WA_AGENT_NAME": "outro-agente",
+        "WA_BRIDGE_URL": "$URL"$extra_json
+      }
+    }
+  }
+}
+
+Depois de plugar, reinicie o agente e peça: "use wa_session_status".
+Dê ao agente as regras de uso: docs/LLMS.md (cole no CLAUDE.md/AGENTS.md do projeto).
+EOF
+}
+
+# ---------------------------------------------------------------- diagnóstico
+
+cmd_doctor() {
+  echo
+  bold "diagnóstico"
+  local node
+  if node="$(node_bin 2>/dev/null)"; then ok "node $("$node" -v)"; else fail "Node >= 24 não encontrado"; fi
+  [[ -d "$REPO_DIR/node_modules" ]] && ok "dependências instaladas" || fail "dependências ausentes — ./wa-bridge setup"
+  [[ -f "$REPO_DIR/daemon/dist/index.js" && -f "$REPO_DIR/mcp/dist/index.js" ]] \
+    && ok "build presente" || fail "build ausente — ./wa-bridge setup"
+  command -v "${FFMPEG_BIN:-ffmpeg}" >/dev/null && ok "ffmpeg presente" || fail "ffmpeg ausente (sem transcrição)"
+  command -v "${WHISPER_BIN:-whisper-cli}" >/dev/null \
+    && ok "whisper-cli presente" || fail "whisper-cli ausente (sem transcrição)"
+  local model="${WHISPER_MODEL:-$HOME_DIR/models/ggml-$DEFAULT_MODEL_NAME.bin}"
+  model="${model/#\~/$HOME}"
+  [[ -f "$model" ]] && ok "modelo whisper: $(du -h "$model" | cut -f1)" \
+    || fail "modelo ausente em $model — áudio não será transcrito (./wa-bridge setup)"
+  [[ -f "$HOME_DIR/auth/creds.json" ]] && ok "credencial do WhatsApp presente" \
+    || warn "sem credencial — vai precisar parear"
+  if [[ -f "$HOME_DIR/token" ]]; then
+    local perms; perms="$(file_mode "$HOME_DIR/token")"
+    [[ "$perms" == "600" ]] && ok "token com permissão 600" || warn "token com permissão $perms (esperado 600)"
+  fi
+  cmd_status
+}
+
+usage() {
+  sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+cmd="${1:-status}"
+[[ $# -gt 0 ]] && shift
+case "$cmd" in
+  setup)      cmd_setup "$@" ;;
+  start)      cmd_start ;;
+  stop)       cmd_stop ;;
+  restart)    cmd_restart ;;
+  status)     cmd_status ;;
+  logs)       cmd_logs ;;
+  pair)       cmd_pair "$@" ;;
+  qr)         cmd_qr ;;
+  open)       cmd_open ;;
+  token)      cmd_token ;;
+  mcp-config) cmd_mcp_config ;;
+  doctor)     cmd_doctor ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

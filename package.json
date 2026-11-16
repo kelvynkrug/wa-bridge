@@ -1,0 +1,40 @@
+{
+  "name": "wa-bridge",
+  "private": true,
+  "type": "module",
+  "description": "Ponte entre o seu WhatsApp e agentes de código (Claude Code, Codex, opencode...): daemon único + shim MCP, com envio atrás de confirmação humana",
+  "license": "MIT",
+  "author": "Vinícius Machado",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinicius1209/wa-bridge.git"
+  },
+  "workspaces": [
+    "daemon",
+    "mcp"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "npm run dev -w daemon",
+    "start": "npm run start -w daemon",
+    "build": "npm run build -w daemon && npm run build -w mcp",
+    "typecheck": "npm run typecheck -w daemon && npm run typecheck -w mcp",
+    "test": "npm run test -w daemon && npm run test -w mcp",
+    "pair": "./wa-bridge pair",
+    "up": "./wa-bridge start",
+    "down": "./wa-bridge stop",
+    "status": "./wa-bridge status",
+    "doctor": "./wa-bridge doctor",
+    "token": "./wa-bridge token",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d",
+    "docker:stop": "docker compose stop",
+    "docker:start": "docker compose start",
+    "docker:logs": "docker compose logs -f wa-bridge",
+    "docker:down": "docker compose down",
+    "docker:shell": "docker compose exec wa-bridge bash",
+    "setup": "./wa-bridge setup"
+  }
+}

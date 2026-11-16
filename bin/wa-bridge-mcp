@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# Wrapper do shim MCP. É ISTO que vai nas configs dos agentes, não o caminho do node.
+#
+# Vantagem sobre apontar direto para o binário do nvm: trocar de versão de Node não
+# quebra as configs dos agentes. O shebang é absoluto, então funciona mesmo
+# em processos GUI sem PATH.
+#
+# stdout pertence ao protocolo MCP: só o processo do Node escreve nele. Tudo que é
+# diagnóstico vai para stderr, senão a sessão MCP é corrompida.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$HERE/.." && pwd)"
+ENTRY="$REPO_DIR/mcp/dist/index.js"
+
+# shellcheck source=./resolve-node.sh
+source "$HERE/resolve-node.sh"
+
+NODE_BIN="$(resolve_node)" || exit 1
+
+if [[ ! -f "$ENTRY" ]]; then
+  echo "wa-bridge: $ENTRY não existe — rode 'npm run build' em $REPO_DIR" >&2
+  exit 1
+fi
+
+# `exec` troca o processo: o Node herda stdin/stdout e os sinais do cliente MCP
+# diretamente, sem um bash intermediário atrapalhando o encerramento.
+exec "$NODE_BIN" "$ENTRY" "$@"

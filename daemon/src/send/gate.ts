@@ -1,0 +1,639 @@
+/**
+ * Gate de envio: todo envio passa por `draft()` (preview + token) e `confirm()`
+ * (consumo único do token). Esta é a parte mais sensível do daemon — ver os
+ * invariantes de segurança em docs/ARQUITETURA.md ("Gate de envio").
+ */
+import { randomBytes, randomUUID } from 'node:crypto';
+import { accessSync, constants as fsConstants } from 'node:fs';
+import { isQuietHour, maskNumber, type Config } from '../config.js';
+import type { Audit } from '../obs/audit.js';
+import type { Metrics } from '../obs/metrics.js';
+import type { DraftRecord, Store } from '../store/store.js';
+import type { DraftInput, Logger, MentionPreview, SendDraft, SendWarning } from '../types.js';
+import type { WhatsAppConnection } from '../whatsapp/connection.js';
+import { isBlocked as isBlockedJid } from './blocklist.js';
+import { AppError } from './errors.js';
+import { compressPlan, executePlan, planDelay, splitBubbles } from './human-delay.js';
+import {
+  applyMentionPlaceholders,
+  mentionsForChunk,
+  placeholderFor,
+  type ResolvedMention,
+} from './mentions.js';
+
+const LARGE_TEXT_THRESHOLD = 1200;
+const AMBIGUITY_SCORE_GAP = 0.15;
+const ONE_HOUR_MS = 3_600_000;
+
+/** Contexto de chamada (quem está chamando e o traceId da requisição HTTP). */
+export interface CallCtx {
+  agent?: string;
+  traceId?: string;
+}
+
+/**
+ * Payload persistido em `drafts.payload_json`. Guardamos aqui tudo que o
+ * `confirm()` precisa para executar o envio sem depender de estado em memória
+ * (o processo pode, em teoria, reconstruir o envio só a partir do token).
+ */
+interface DraftPayload {
+  chatJid: string;
+  text: string | null;
+  mediaPath: string | null;
+  caption: string | null;
+  quoteMessageId: string | null;
+  bubbles: string[];
+  /** Menções já resolvidas e validadas no `draft()`; o `confirm()` não re-resolve. */
+  mentions: ResolvedMention[];
+  warnings: SendWarning[];
+  estimatedDelayMs: number;
+}
+
+/** Estado de aborto em memória para um envio em andamento (o processo é único). */
+interface AbortState {
+  abort: boolean;
+}
+
+export class SendGate {
+  private readonly wa: WhatsAppConnection;
+  private readonly store: Store;
+  private readonly log: Logger;
+  private readonly metrics: Metrics;
+  private readonly audit: Audit;
+  private readonly config: Config;
+  private readonly abortFlags = new Map<string, AbortState>();
+
+  constructor(deps: {
+    wa: WhatsAppConnection;
+    store: Store;
+    log: Logger;
+    metrics: Metrics;
+    audit: Audit;
+    config: Config;
+  }) {
+    this.wa = deps.wa;
+    this.store = deps.store;
+    this.log = deps.log;
+    this.metrics = deps.metrics;
+    this.audit = deps.audit;
+    this.config = deps.config;
+  }
+
+  /** Verifica blocklist (defaults inegociáveis + `blocklist.json`) para um JID. */
+  isBlocked(jid: string): { blocked: boolean; reason?: string } {
+    return isBlockedJid(this.config, jid);
+  }
+
+  /** Resolve `to` (JID literal ou query de contato) sem nunca escolher por conta própria em caso de ambiguidade. */
+  private resolveTarget(to: string): { jid: string; name: string | null; lastContactAt: number | null } {
+    if (to.includes('@')) {
+      return { jid: to, name: null, lastContactAt: this.store.lastContactAt(to) };
+    }
+    const matches = this.store.resolveContact(to);
+    const best = matches[0];
+    if (!best) {
+      throw new AppError('NOT_FOUND', 404, `nenhum contato encontrado para "${to}"`);
+    }
+    const second = matches[1];
+    if (second && best.score - second.score < AMBIGUITY_SCORE_GAP) {
+      throw new AppError('AMBIGUOUS_CONTACT', 409, 'mais de um contato corresponde à busca; não escolhemos por você', {
+        candidates: matches,
+      });
+    }
+    return { jid: best.jid, name: best.name, lastContactAt: best.lastContactAt };
+  }
+
+  /**
+   * Resolve cada menção pedida em um membro do grupo de destino.
+   *
+   * Validar a pertinência ao grupo é requisito de segurança, não conveniência: o
+   * `mentionedJid` de uma mensagem é visível para todos os participantes, então
+   * marcar quem não está no grupo vaza o número dessa pessoa para o grupo inteiro —
+   * o mesmo vazamento que `QUOTE_WRONG_CHAT` barra na citação.
+   */
+  private async resolveMentions(chatJid: string, requested: string[]): Promise<ResolvedMention[]> {
+    if (!chatJid.endsWith('@g.us')) {
+      throw new AppError(
+        'MENTION_NOT_GROUP_CHAT',
+        400,
+        'menção só faz sentido em grupo: em conversa individual ela não notifica ninguém e expõe o número de quem foi marcado',
+      );
+    }
+
+    const participants = await this.wa.getGroupParticipants(chatJid);
+    if (participants.length === 0) {
+      throw new AppError(
+        'GROUP_NOT_SYNCED',
+        503,
+        'não foi possível obter a lista de membros deste grupo; tente de novo em alguns instantes',
+      );
+    }
+
+    const resolved: ResolvedMention[] = [];
+    const seen = new Set<string>();
+
+    for (const raw of requested) {
+      const query = raw.trim();
+      if (query.length === 0) continue;
+
+      const matches = this.store.resolveGroupParticipant(chatJid, query);
+      const best = matches[0];
+      if (!best) {
+        throw new AppError(
+          'MENTION_NOT_IN_GROUP',
+          404,
+          `"${query}" não foi encontrado entre os membros deste grupo`,
+          // Quem nunca falou no grupo não tem nome conhecido — só número. Dizer o
+          // total ajuda o humano a entender que a lista existe, mas é anônima.
+          { groupMembers: participants.length },
+        );
+      }
+      const second = matches[1];
+      if (second && best.score - second.score < AMBIGUITY_SCORE_GAP) {
+        throw new AppError(
+          'MENTION_AMBIGUOUS',
+          409,
+          `mais de um membro do grupo corresponde a "${query}"; não escolhemos por você`,
+          { candidates: matches.slice(0, 8) },
+        );
+      }
+
+      if (seen.has(best.jid)) continue;
+      seen.add(best.jid);
+
+      const mentionJids = best.phoneJid && best.phoneJid !== best.jid ? [best.jid, best.phoneJid] : [best.jid];
+      resolved.push({
+        jid: best.jid,
+        phoneJid: best.phoneJid,
+        name: best.name,
+        maskedNumber: best.maskedNumber,
+        query,
+        placeholder: placeholderFor(best.jid),
+        mentionJids,
+      });
+    }
+
+    return resolved;
+  }
+
+  /** Garante que `mediaPath`, se informado, existe e é legível. */
+  private assertMediaReadable(mediaPath: string): void {
+    try {
+      accessSync(mediaPath, fsConstants.R_OK);
+    } catch {
+      throw new AppError('MEDIA_NOT_FOUND', 404, `arquivo de mídia não encontrado ou ilegível: ${mediaPath}`);
+    }
+  }
+
+  /** Cria um rascunho de envio: resolve destino, valida blocklist/rate-limit e monta o preview. */
+  async draft(input: DraftInput, ctx: CallCtx = {}): Promise<SendDraft> {
+    const agent = ctx.agent ?? 'unknown';
+    const traceId = ctx.traceId ?? randomUUID();
+    const now = Date.now();
+
+    if (!input.to || input.to.trim().length === 0) {
+      throw new AppError('VALIDATION', 400, '"to" é obrigatório');
+    }
+    if ((!input.text || input.text.trim().length === 0) && !input.mediaPath) {
+      throw new AppError('VALIDATION', 400, 'draft precisa de "text" e/ou "mediaPath"');
+    }
+
+    const resolved = this.resolveTarget(input.to);
+    const jid = resolved.jid;
+
+    const block = this.isBlocked(jid);
+    if (block.blocked) {
+      this.audit.record({
+        ts: now,
+        traceId,
+        agent,
+        action: 'send.blocked',
+        chatJid: jid,
+        outcome: 'denied',
+        detail: { reason: block.reason, stage: 'draft' },
+      });
+      throw new AppError('BLOCKED', 403, `destino bloqueado (${block.reason})`);
+    }
+
+    if (input.mediaPath) this.assertMediaReadable(input.mediaPath);
+
+    // Marca como 'expired' o que já venceu, para o banco e o dashboard refletirem a
+    // realidade. A correção do bloqueio está no filtro de `activeDraftForChat`; isto
+    // é higiene, não a trava.
+    this.store.expireDrafts(now);
+
+    const pending = this.store.activeDraftForChat(jid);
+    if (pending) {
+      throw new AppError('DRAFT_ALREADY_PENDING', 409, 'já existe um rascunho pendente para este chat', {
+        confirmToken: pending.confirmToken,
+      });
+    }
+
+    const sentLastHour = this.store.countSendsSince(now - ONE_HOUR_MS);
+    if (sentLastHour >= this.config.sendsPerHour) {
+      throw new AppError('RATE_LIMITED', 429, `limite de ${this.config.sendsPerHour} envios/hora atingido`);
+    }
+
+    // Validar a citação ANTES de montar o rascunho. Duas razões: citar uma mensagem de
+    // OUTRA conversa vazaria o conteúdo dela para este chat, e citar um id inexistente
+    // produziria um envio sem a citação que o humano aprovou — ambos silenciosos.
+    let quotedPreview: SendDraft['quotedPreview'] = null;
+    if (input.quoteMessageId) {
+      const quotedMsg = this.store.getMessage(input.quoteMessageId);
+      if (!quotedMsg) {
+        throw new AppError('QUOTE_NOT_FOUND', 404, `mensagem citada "${input.quoteMessageId}" não encontrada`);
+      }
+      if (quotedMsg.chatJid !== jid) {
+        throw new AppError(
+          'QUOTE_WRONG_CHAT',
+          409,
+          'a mensagem citada pertence a outra conversa — citá-la aqui vazaria o conteúdo dela',
+        );
+      }
+      quotedPreview = {
+        messageId: quotedMsg.id,
+        senderName: quotedMsg.fromMe ? 'você' : quotedMsg.senderName,
+        text: quotedMsg.text,
+      };
+    }
+
+    // Resolver as menções ANTES de montar o texto final: elas mudam o texto (o
+    // placeholder `@<dígitos>` é injetado) e o preview precisa mostrar exatamente o
+    // que vai sair, não o que o agente escreveu.
+    const mentions = input.mentions?.length ? await this.resolveMentions(jid, input.mentions) : [];
+
+    let text = input.text ?? null;
+    let caption = input.caption ?? null;
+    if (mentions.length > 0) {
+      if (text !== null) text = applyMentionPlaceholders(text, mentions);
+      else caption = applyMentionPlaceholders(caption ?? '', mentions);
+    }
+
+    const bubbles = text ? splitBubbles(text) : [];
+    const plan = compressPlan(planDelay(bubbles), this.config.sendMaxDelayMs);
+
+    const warnings: SendWarning[] = [];
+    if (resolved.lastContactAt === null) warnings.push('NEVER_CONTACTED');
+    if (isQuietHour(this.config, new Date(now))) warnings.push('QUIET_HOURS');
+    if (jid.endsWith('@g.us')) warnings.push('GROUP_CHAT');
+    if ((text?.length ?? 0) > LARGE_TEXT_THRESHOLD) warnings.push('LARGE_TEXT');
+
+    const confirmToken = randomBytes(24).toString('base64url');
+    const expiresAt = now + this.config.draftTtlMs;
+    const payload: DraftPayload = {
+      chatJid: jid,
+      text,
+      mediaPath: input.mediaPath ?? null,
+      caption,
+      quoteMessageId: input.quoteMessageId ?? null,
+      bubbles,
+      mentions,
+      warnings,
+      estimatedDelayMs: plan.totalMs,
+    };
+
+    this.store.insertDraft({
+      confirmToken,
+      chatJid: jid,
+      payloadJson: JSON.stringify(payload),
+      agent,
+      traceId,
+      createdAt: now,
+      expiresAt,
+      status: 'pending',
+    });
+
+    this.audit.record({
+      ts: now,
+      traceId,
+      agent,
+      action: 'draft.created',
+      chatJid: jid,
+      outcome: 'ok',
+      detail: {
+        confirmToken,
+        warnings,
+        bubbles: bubbles.length,
+        ...(mentions.length > 0 ? { mentions: mentions.map((m) => m.jid) } : {}),
+      },
+    });
+
+    const mentionsPreview: MentionPreview[] = mentions.map((m) => ({
+      jid: m.jid,
+      name: m.name,
+      maskedNumber: m.maskedNumber,
+      placeholder: m.placeholder,
+    }));
+
+    return {
+      confirmToken,
+      chatJid: jid,
+      resolvedName: resolved.name,
+      maskedNumber: maskNumber(this.store.phoneFor(jid)),
+      lastContactAt: resolved.lastContactAt,
+      neverContacted: resolved.lastContactAt === null,
+      bubbles,
+      mediaPath: input.mediaPath ?? null,
+      quotedPreview,
+      mentionsPreview,
+      estimatedDelayMs: plan.totalMs,
+      warnings,
+      expiresAt,
+    };
+  }
+
+  /**
+   * Consome o `confirmToken` atomicamente (uma única vez), revalida blocklist e
+   * avisos pendentes de confirmação, e dispara o envio em background. Responde
+   * de imediato — o delay humano nunca bloqueia a resposta HTTP.
+   */
+  async confirm(
+    confirmToken: string,
+    agent: string,
+    opts: { urgent?: boolean; acknowledge?: string[]; traceId?: string } = {},
+  ): Promise<{ sendId: string; etaMs: number }> {
+    const traceId = opts.traceId ?? randomUUID();
+    const now = Date.now();
+
+    // Todas as validações rodam ANTES de consumir o token. Se o consumo viesse primeiro,
+    // um confirm sem o `acknowledge`/`urgent` exigido queimaria o rascunho: o agente
+    // recebe CONFIRMATION_REQUIRED, repete com o campo certo e ganha "token já consumed",
+    // obrigando a refazer o rascunho e a mostrar tudo de novo ao humano.
+    const existing = this.store.getDraft(confirmToken);
+    if (!existing) {
+      throw new AppError('DRAFT_NOT_FOUND', 404, 'token de confirmação não encontrado');
+    }
+    if (existing.status !== 'pending') {
+      throw new AppError('DRAFT_NOT_FOUND', 404, `token de confirmação já ${existing.status}`);
+    }
+    if (existing.expiresAt <= now) {
+      this.audit.record({
+        ts: now,
+        traceId,
+        agent,
+        action: 'draft.expired',
+        chatJid: existing.chatJid,
+        outcome: 'denied',
+        detail: { confirmToken },
+      });
+      throw new AppError('DRAFT_NOT_FOUND', 404, 'token de confirmação expirado');
+    }
+
+    const payload = JSON.parse(existing.payloadJson) as DraftPayload;
+    const jid = payload.chatJid;
+
+    // Revalida blocklist: o arquivo pode ter sido editado entre o draft e o confirm.
+    const block = this.isBlocked(jid);
+    if (block.blocked) {
+      this.audit.record({
+        ts: now,
+        traceId,
+        agent,
+        action: 'send.blocked',
+        chatJid: jid,
+        outcome: 'denied',
+        detail: { reason: block.reason, stage: 'confirm' },
+      });
+      throw new AppError('BLOCKED', 403, `destino bloqueado (${block.reason})`);
+    }
+
+    const missing: string[] = [];
+    if (payload.warnings.includes('NEVER_CONTACTED') && !(opts.acknowledge ?? []).includes('NEVER_CONTACTED')) {
+      missing.push('acknowledge:NEVER_CONTACTED');
+    }
+    if (payload.warnings.includes('QUIET_HOURS') && opts.urgent !== true) {
+      missing.push('urgent');
+    }
+    if (missing.length > 0) {
+      throw new AppError('CONFIRMATION_REQUIRED', 428, 'confirmação adicional necessária', { missing });
+    }
+
+    if (payload.mediaPath) this.assertMediaReadable(payload.mediaPath);
+
+    // Rate limit TAMBÉM aqui, não só no draft. As linhas de `sends` só nascem no confirm,
+    // então checar apenas no draft é furado: dá para criar N rascunhos em N chats enquanto
+    // o contador está em zero e confirmar todos depois, estourando o limite à vontade.
+    // O confirm é onde a mensagem realmente sai, logo é onde o limite precisa valer.
+    const sentLastHour = this.store.countSendsSince(now - ONE_HOUR_MS);
+    if (sentLastHour >= this.config.sendsPerHour) {
+      this.audit.record({
+        ts: now,
+        traceId,
+        agent,
+        action: 'send.blocked',
+        chatJid: jid,
+        outcome: 'denied',
+        detail: { reason: 'RATE_LIMITED', stage: 'confirm', sentLastHour },
+      });
+      throw new AppError('RATE_LIMITED', 429, `limite de ${this.config.sendsPerHour} envios/hora atingido`);
+    }
+
+    // Consumo atômico: UPDATE ... WHERE status='pending' AND expires_at > now, checando
+    // `changes` dentro do próprio Store. É ISTO que garante o single-use sob concorrência;
+    // a leitura acima só serve para validar sem queimar o token.
+    const row: DraftRecord | null = this.store.consumeDraft(confirmToken, now);
+    if (!row) {
+      throw new AppError('DRAFT_NOT_FOUND', 404, 'token de confirmação já usado por outra chamada');
+    }
+
+    const sendId = randomBytes(12).toString('base64url');
+    this.store.insertSend({
+      sendId,
+      chatJid: jid,
+      agent,
+      traceId,
+      startedAt: now,
+      finishedAt: null,
+      stage: 'queued',
+      bubblesTotal: payload.bubbles.length,
+      bubblesSent: 0,
+      cancelled: false,
+      messageIdsJson: '[]',
+    });
+    this.abortFlags.set(sendId, { abort: false });
+
+    this.audit.record({
+      ts: now,
+      traceId,
+      agent,
+      action: 'send.confirmed',
+      chatJid: jid,
+      outcome: 'ok',
+      detail: { sendId },
+    });
+
+    // Dispara em background — a resposta HTTP não espera o delay humano.
+    void this.runSend(sendId, jid, payload, agent, traceId);
+
+    return { sendId, etaMs: payload.estimatedDelayMs };
+  }
+
+  /** Executa o envio (mídia primeiro, depois bubbles de texto) e atualiza `stage` conforme avança. */
+  private async runSend(sendId: string, jid: string, payload: DraftPayload, agent: string, traceId: string): Promise<void> {
+    const abortState = this.abortFlags.get(sendId);
+    const sentIds: string[] = [];
+    // Rascunho criado por uma versão anterior do daemon não tem `mentions` no payload.
+    const mentions = payload.mentions ?? [];
+    try {
+      if (!abortState || abortState.abort) {
+        this.finishAsCancelled(sendId, jid, agent, traceId, sentIds);
+        return;
+      }
+
+      this.store.updateSend(sendId, { stage: 'reading' });
+
+      // A citação vai só na PRIMEIRA mensagem do envio. Citar a mesma mensagem em todos
+      // os bubbles é o que um bot faria; humano cita uma vez e continua na sequência.
+      let quoted = payload.quoteMessageId ? this.wa.buildQuoted(payload.quoteMessageId) : undefined;
+      if (payload.quoteMessageId && !quoted) {
+        this.log.warn(
+          { sendId, quoteMessageId: payload.quoteMessageId },
+          'mensagem citada não encontrada — enviando sem citação',
+        );
+      }
+
+      if (payload.mediaPath) {
+        if (abortState.abort) {
+          this.finishAsCancelled(sendId, jid, agent, traceId, sentIds);
+          return;
+        }
+        await this.wa.setPresence(jid, 'composing');
+        const mediaId = await this.wa.sendMedia(
+          jid,
+          payload.mediaPath,
+          payload.caption ?? undefined,
+          quoted,
+          mentionsForChunk(payload.caption ?? '', mentions),
+        );
+        quoted = undefined; // consumida pela mídia
+        sentIds.push(mediaId);
+        this.store.updateSend(sendId, { bubblesSent: sentIds.length, messageIdsJson: JSON.stringify(sentIds) });
+      }
+
+      if (payload.bubbles.length > 0) {
+        this.store.updateSend(sendId, { stage: 'typing' });
+        const plan = compressPlan(planDelay(payload.bubbles), this.config.sendMaxDelayMs);
+        await executePlan(plan, {
+          presence: (p) => this.wa.setPresence(jid, p),
+          shouldAbort: () => abortState.abort,
+          send: async (bubble) => {
+            this.store.updateSend(sendId, { stage: 'sending' });
+            // Menção NÃO se consome como a citação: cada bubble leva as suas, porque é
+            // o `@<dígitos>` presente naquele bubble que o app casa com o `mentionedJid`.
+            const id = await this.wa.sendText(jid, bubble, quoted, mentionsForChunk(bubble, mentions));
+            quoted = undefined; // só o primeiro bubble cita
+            sentIds.push(id);
+            this.store.updateSend(sendId, { bubblesSent: sentIds.length, messageIdsJson: JSON.stringify(sentIds) });
+            return id;
+          },
+        });
+      }
+
+      const finishedAt = Date.now();
+      if (abortState.abort) {
+        this.store.updateSend(sendId, {
+          stage: 'cancelled',
+          finishedAt,
+          cancelled: true,
+          messageIdsJson: JSON.stringify(sentIds),
+        });
+        this.audit.record({
+          ts: finishedAt,
+          traceId,
+          agent,
+          action: 'send.cancelled',
+          chatJid: jid,
+          outcome: 'ok',
+          detail: { sendId, sent: sentIds.length },
+        });
+      } else {
+        this.store.updateSend(sendId, { stage: 'done', finishedAt, messageIdsJson: JSON.stringify(sentIds) });
+        this.audit.record({
+          ts: finishedAt,
+          traceId,
+          agent,
+          action: 'send.completed',
+          chatJid: jid,
+          outcome: 'ok',
+          detail: { sendId, sent: sentIds.length },
+        });
+      }
+    } catch (error) {
+      const finishedAt = Date.now();
+      this.store.updateSend(sendId, { stage: 'failed', finishedAt, messageIdsJson: JSON.stringify(sentIds) });
+      this.log.error({ error, sendId, traceId }, 'falha ao executar envio');
+      this.audit.record({
+        ts: finishedAt,
+        traceId,
+        agent,
+        action: 'send.failed',
+        chatJid: jid,
+        outcome: 'error',
+        detail: { sendId, error: error instanceof Error ? error.message : String(error) },
+      });
+    } finally {
+      this.abortFlags.delete(sendId);
+    }
+  }
+
+  /** Marca um envio como cancelado antes mesmo de começar a enviar qualquer coisa. */
+  private finishAsCancelled(sendId: string, jid: string, agent: string, traceId: string, sentIds: string[]): void {
+    const finishedAt = Date.now();
+    this.store.updateSend(sendId, {
+      stage: 'cancelled',
+      finishedAt,
+      cancelled: true,
+      messageIdsJson: JSON.stringify(sentIds),
+    });
+    this.audit.record({
+      ts: finishedAt,
+      traceId,
+      agent,
+      action: 'send.cancelled',
+      chatJid: jid,
+      outcome: 'ok',
+      detail: { sendId, sent: sentIds.length },
+    });
+    this.abortFlags.delete(sendId);
+  }
+
+  /**
+   * Descarta um rascunho ainda não confirmado, liberando o chat para um novo.
+   *
+   * Sem isto, revisar o texto antes de enviar obriga a esperar o TTL de 5 minutos — o
+   * gate recusa um segundo rascunho para o mesmo chat (`DRAFT_ALREADY_PENDING`), que é
+   * a trava correta contra envio em massa, mas vira um impasse na revisão normal.
+   */
+  async discardDraft(confirmToken: string, ctx: CallCtx = {}): Promise<{ discarded: boolean }> {
+    const existing = this.store.getDraft(confirmToken);
+    if (!existing) {
+      throw new AppError('DRAFT_NOT_FOUND', 404, 'token de confirmação não encontrado');
+    }
+    const discarded = this.store.cancelDraft(confirmToken);
+    this.audit.record({
+      ts: Date.now(),
+      traceId: ctx.traceId ?? randomUUID(),
+      agent: ctx.agent ?? 'unknown',
+      action: 'send.cancelled',
+      chatJid: existing.chatJid,
+      outcome: 'ok',
+      detail: { stage: 'draft', discarded },
+    });
+    return { discarded };
+  }
+
+  /** Marca o abort flag de um envio em andamento; `shouldAbort()` do plano em execução o vê. */
+  async cancel(sendId: string, _ctx: CallCtx = {}): Promise<{ cancelled: boolean; stage: string }> {
+    const row = this.store.getSend(sendId);
+    if (!row) {
+      throw new AppError('NOT_FOUND', 404, `envio "${sendId}" não encontrado`);
+    }
+    const state = this.abortFlags.get(sendId);
+    if (!state) {
+      // Já não está em execução: terminou antes do pedido de cancelamento chegar.
+      return { cancelled: false, stage: row.stage };
+    }
+    state.abort = true;
+    return { cancelled: true, stage: row.stage };
+  }
+}

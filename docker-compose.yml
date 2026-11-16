@@ -1,0 +1,67 @@
+# wa-bridge em Docker. Ver docs/OPERACAO.md para o runbook completo.
+#
+# ATENÇÃO — NUNCA rode o daemon do host (`npm run dev` / launchd) e este
+# container ao mesmo tempo. Ambos leem/escrevem as MESMAS credenciais em
+# ${HOME}/.wa-bridge/auth — duas sessões Baileys concorrentes na mesma conta
+# derrubam o WhatsApp com `device_removed` (reparelhamento obrigatório).
+# launchd e Docker são alternativas EXCLUDENTES, nunca complementares.
+#
+# Este compose depende de ${HOME} vir definido no shell que o invoca (é o
+# padrão em qualquer shell de login do macOS/Linux). Se `echo $HOME` vier
+# vazio, exporte antes: `export HOME=/Users/seu-usuario`.
+
+services:
+  wa-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wa-bridge:0.1.0
+    container_name: wa-bridge
+    restart: unless-stopped
+    init: true
+
+    # Porta só em loopback — nunca 0.0.0.0. O daemon faz bind em 127.0.0.1
+    # DENTRO do container, o que é a loopback do próprio container — inalcançável de fora por definição do
+    # Docker. Por isso a imagem sobe um `socat` interno (ver
+    # docker/entrypoint.sh) que escuta em 0.0.0.0:17788 dentro do container
+    # e repassa para 127.0.0.1:7788; aqui só mapeamos a porta pública (7788,
+    # a mesma de sempre) para essa porta de relay. Por fora, nada muda: só
+    # 127.0.0.1 da máquina chega no daemon, nunca a rede.
+    ports:
+      - "127.0.0.1:7788:17788"
+
+    # Bind-mount no MESMO caminho absoluto dentro e fora do container. É o
+    # que faz MediaArtifact.path e framePaths devolvidos pelo daemon serem
+    # lidos corretamente pelo agente de código que roda no host — se os
+    # caminhos divergissem, a leitura de mídia quebraria silenciosamente.
+    volumes:
+      - ${HOME}/.wa-bridge:${HOME}/.wa-bridge
+
+    environment:
+      WA_BRIDGE_HOME: ${HOME}/.wa-bridge
+      WA_BRIDGE_PORT: "7788"
+      LOG_LEVEL: "info"
+      WA_QUIET_HOURS: "23:00-07:00"
+      WA_SEND_MAX_DELAY_MS: "45000"
+      WA_DRAFT_TTL_MS: "300000"
+      WA_SENDS_PER_HOUR: "10"
+      WHISPER_MODEL: ${HOME}/.wa-bridge/models/ggml-large-v3-turbo.bin
+      WHISPER_LANGUAGE: "pt"
+      WHISPER_BIN: /usr/local/bin/whisper-cli
+      FFMPEG_BIN: /usr/bin/ffmpeg
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7788/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # Teto de recurso para a transcrição não comer a memória alocada ao
+    # Docker por inteiro. O modelo large-v3-turbo carregado + ffmpeg cabem
+    # confortavelmente em 4 GB; CPU a 4 núcleos deixa headroom para o host.
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4g
