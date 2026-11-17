@@ -254,7 +254,11 @@ export class WhatsAppConnection {
 }
 ```
 
-Entrada de mensagens, por origem:
+Entrada de mensagens, por origem. Em qualquer origem, `protocolMessage` de sincronização
+entre os aparelhos da conta (histórico, chaves, configurações; lista em
+`whatsapp/protocol.ts`) não vira mensagem: o celular manda isso na conversa do usuário com
+ele mesmo. Edição e "apagar para todos" não estão na lista.
+
 
 - **ao vivo** (`messages.upsert` com `notify`): `upsertMessage`, soma em não lidas,
   dispara `onMessage` (e o stream `/events`).
@@ -609,6 +613,7 @@ passo já publicado.
 |---|---|
 | 1 | schema acima (idempotente) + coluna `contacts.phone_jid` |
 | 2 | `idx_messages_ts` + índice de busca FTS5 (abaixo), com `rebuild` do que já existia |
+| 3 | apaga as `unknown` que são `protocolMessage` de sincronização entre aparelhos, gravadas antes do filtro de entrada |
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);

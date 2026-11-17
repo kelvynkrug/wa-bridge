@@ -24,6 +24,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import type { GroupParticipant, Logger, MessageType, SessionState, StoredMessage } from '../types.js';
 import type { Store } from '../store/store.js';
+import { isDeviceSyncProtocolType } from './protocol.js';
 
 /** Métricas mínimas exigidas pela assinatura do contrato (ver `obs/metrics.ts`). */
 export interface Metrics {
@@ -127,6 +128,11 @@ function unwrapMessage(message: WAMessageContent): WAMessageContent {
     message.viewOnceMessage?.message ??
     message.viewOnceMessageV2Extension?.message;
   return (inner as WAMessageContent | null | undefined) ?? message;
+}
+
+/** Verdadeiro para mensagem de sincronização entre os aparelhos da conta (ver `protocol.ts`). */
+function isDeviceSyncMessage(message: WAMessageContent): boolean {
+  return isDeviceSyncProtocolType(unwrapMessage(message).protocolMessage?.type);
 }
 
 /** Verdadeiro se a mensagem (ainda embrulhada) for um envio `viewOnce`. */
@@ -755,7 +761,7 @@ export class WhatsAppConnection {
 
   /** Converte uma mensagem bruta do Baileys em `StoredMessage`. */
   private parseMessage(raw: WAMessage, remoteJid: string): StoredMessage | null {
-    if (!raw.message) return null;
+    if (!raw.message || isDeviceSyncMessage(raw.message)) return null;
     const chatJid = normalizeJid(remoteJid);
     const fromMe = raw.key.fromMe ?? false;
     const senderJid = fromMe

@@ -4,6 +4,7 @@
  */
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { maskNumber } from '../config.js';
+import { DEVICE_SYNC_PROTOCOL_TYPES } from '../whatsapp/protocol.js';
 import type {
   AuditAction,
   AuditEvent,
@@ -413,6 +414,7 @@ export class Store {
     const steps: Array<() => void> = [
       () => this.migrateBaseSchema(),
       () => this.migrateSearchIndex(),
+      () => this.migrateDropDeviceSyncMessages(),
     ];
     const row = this.db.prepare('PRAGMA user_version').get() as unknown as { user_version: number };
     for (let target = Number(row.user_version) + 1; target <= steps.length; target += 1) {
@@ -537,6 +539,41 @@ export class Store {
       INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
       INSERT INTO media_fts(media_fts) VALUES ('rebuild');
     `);
+  }
+
+  /**
+   * Passo 3: apaga as mensagens de sincronização entre aparelhos (`protocolMessage` de
+   * histórico, chaves e configurações) que versões anteriores gravavam como `unknown` na
+   * conversa do usuário com ele mesmo. O `raw_json` guarda o tipo pelo nome; o número
+   * cobre gravações sem essa conversão. `raw_json` inválido fica como está.
+   *
+   * Essa conversa só aparecia na lista por causa delas: se fica sem mensagem, sai de
+   * `chats`; se ainda tem outras, a última atividade volta a ser a dessas.
+   */
+  private migrateDropDeviceSyncMessages(): void {
+    const types: Array<string | number> = [
+      ...Object.keys(DEVICE_SYNC_PROTOCOL_TYPES),
+      ...Object.values(DEVICE_SYNC_PROTOCOL_TYPES),
+    ];
+    const match = `type = 'unknown'
+      AND CASE WHEN json_valid(raw_json)
+               THEN json_extract(raw_json, '$.message.protocolMessage.type') END
+          IN (${types.map(() => '?').join(', ')})`;
+    const chats = this.db
+      .prepare(`SELECT DISTINCT chat_jid AS jid FROM messages WHERE ${match}`)
+      .all(...types) as unknown as Array<{ jid: string }>;
+    this.db.prepare(`DELETE FROM messages WHERE ${match}`).run(...types);
+
+    const dropEmpty = this.db.prepare(
+      'DELETE FROM chats WHERE jid = ? AND NOT EXISTS (SELECT 1 FROM messages WHERE chat_jid = ?)',
+    );
+    const refresh = this.db.prepare(
+      'UPDATE chats SET last_message_at = (SELECT MAX(ts) FROM messages WHERE chat_jid = ?) WHERE jid = ?',
+    );
+    for (const { jid } of chats) {
+      dropEmpty.run(jid, jid);
+      refresh.run(jid, jid);
+    }
   }
 
   /** Fecha o banco. Depois disto nenhum método do Store funciona. */

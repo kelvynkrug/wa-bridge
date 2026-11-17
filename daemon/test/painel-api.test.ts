@@ -144,7 +144,7 @@ test('status da instalação: versão, banco, mídia, retenção, fila e permiss
 
   const snap = await status.snapshot();
   assert.equal(snap.version, '9.9.9');
-  assert.equal(snap.schemaVersion, 2);
+  assert.equal(snap.schemaVersion, 3);
   assert.ok(snap.dbBytes > 0);
   assert.deepEqual({ bytes: snap.media.bytes, files: snap.media.files }, { bytes: 150, files: 2 });
   assert.deepEqual(snap.retention.last, { at: 1234, result: { messages: 0, mediaFiles: 4, calls: 9, drafts: 1 } });
