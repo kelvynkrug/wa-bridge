@@ -147,7 +147,7 @@ Vêm no array `warnings` do `SendDraft`. Nenhum deles bloqueia o draft; eles mud
 | `MENTION_AMBIGUOUS` | 409 | mais de um membro do grupo casou com o nome. **Pergunte ao humano qual é**, com os candidatos que vieram no `detail`. |
 | `MENTION_NOT_GROUP_CHAT` | 400 | você pediu menção numa conversa individual. Remova `mentions` e envie normal. |
 | `GROUP_NOT_SYNCED` | 503 | o daemon ainda não conseguiu a lista de membros do grupo. Tente de novo em alguns instantes; se persistir, avise o humano. |
-| `RATE_LIMITED` | 429 | limite de 10 envios/hora global foi atingido. **Pare.** Não tente de novo em loop — avise o humano e espere. |
+| `RATE_LIMITED` | 429 | um limite de volume estourou; `detail.scope` diz qual. `chat`: o último envio para essa conversa foi há pouco; espere `detail.retryAfterMs` e confirme de novo com o **mesmo** token, uma vez só. `hour` ou `day`: **pare** e avise o humano. `new_contacts` ou `whatsapp_quota`: o limite de conversas novas acabou (o seu ou o do próprio WhatsApp); **não tente** por outro caminho, avise o humano. Nunca tente de novo em loop. |
 | `BLOCKED` | 403 | o JID está na blocklist (defaults embutidos ou `blocklist.json`). Não insista; avise o humano. |
 | `CONFIRMATION_REQUIRED` | 428 | você chamou `confirm` sem satisfazer um warning (`acknowledge`/`urgent` faltando). Releia o draft e corrija. |
 | `UNAUTHORIZED` | 401 | token do daemon ausente/errado, ou o próprio daemon fora do ar. Problema de infraestrutura, não seu — avise o humano. |

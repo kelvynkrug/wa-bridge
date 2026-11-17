@@ -18,6 +18,9 @@ const VARS = [
   'WA_RETENTION_MEDIA_DAYS',
   'WA_RETENTION_METRICS_DAYS',
   'WA_DEVICE_NAME',
+  'WA_SENDS_PER_DAY',
+  'WA_NEW_CONTACTS_PER_DAY',
+  'WA_CHAT_MIN_INTERVAL_SECONDS',
 ] as const;
 const saved = new Map<string, string | undefined>();
 let dir: string;
@@ -85,6 +88,21 @@ test('nome do aparelho: wa-bridge por padrão, aparado, e longo demais falha o b
   assert.equal(loadConfig().deviceName, 'wa-bridge (Mac)');
   process.env.WA_DEVICE_NAME = 'x'.repeat(41);
   assert.throws(() => loadConfig(), /WA_DEVICE_NAME inválido/);
+});
+
+test('limites de envio: 40 por dia, 3 conversas novas, 30s por conversa; 0 desliga conversa nova e intervalo', () => {
+  useHome('limites');
+  let config = loadConfig();
+  assert.equal(config.sendsPerDay, 40);
+  assert.equal(config.newContactsPerDay, 3);
+  assert.equal(config.chatMinIntervalMs, 30_000);
+  process.env.WA_NEW_CONTACTS_PER_DAY = '0';
+  process.env.WA_CHAT_MIN_INTERVAL_SECONDS = '0';
+  config = loadConfig();
+  assert.equal(config.newContactsPerDay, 0);
+  assert.equal(config.chatMinIntervalMs, 0);
+  process.env.WA_SENDS_PER_DAY = '0';
+  assert.throws(() => loadConfig(), /WA_SENDS_PER_DAY inválido/);
 });
 
 test('restrictStateDirs corrige pasta que já existia com 755', () => {

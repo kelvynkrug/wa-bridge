@@ -120,7 +120,7 @@ test('migração 3 apaga as notificações já gravadas e preserva o resto', () 
   const migrated = new Store(path);
   try {
     migrated.migrate();
-    assert.equal(migrated.schemaVersion(), 3);
+    assert.equal(migrated.schemaVersion(), 4);
     for (const id of ['hist', 'chave', 'numero']) assert.equal(migrated.getMessage(id), null, id);
     for (const id of ['edicao', 'quebrado', 'texto']) assert.notEqual(migrated.getMessage(id), null, id);
     assert.equal(migrated.searchMessages({ query: 'reuniao', limit: 5 })[0]?.message.id, 'texto');

@@ -60,6 +60,12 @@ export interface Config {
   sendMaxDelayMs: number;
   draftTtlMs: number;
   sendsPerHour: number;
+  /** Teto de envios em 24h, somando todas as conversas. */
+  sendsPerDay: number;
+  /** Envios para quem nunca conversou com o usuário, em 24h; `0` não deixa iniciar conversa. */
+  newContactsPerDay: number;
+  /** Intervalo mínimo entre dois envios para a mesma conversa; `0` desliga. */
+  chatMinIntervalMs: number;
   /** Dias de histórico importados no pareamento (`messaging-history.set`); `0` desliga. */
   historyDays: number;
   /** Teto de mídias processadas (download, transcrição, keyframes) ao mesmo tempo. */
@@ -193,6 +199,9 @@ export function loadConfig(): Config {
     sendMaxDelayMs: Number(process.env.WA_SEND_MAX_DELAY_MS ?? 45_000),
     draftTtlMs: Number(process.env.WA_DRAFT_TTL_MS ?? 300_000),
     sendsPerHour: Number(process.env.WA_SENDS_PER_HOUR ?? 10),
+    sendsPerDay: intEnv('WA_SENDS_PER_DAY', 40, 1),
+    newContactsPerDay: intEnv('WA_NEW_CONTACTS_PER_DAY', 3, 0),
+    chatMinIntervalMs: intEnv('WA_CHAT_MIN_INTERVAL_SECONDS', 30, 0) * 1000,
     historyDays: intEnv('WA_HISTORY_DAYS', 7, 0),
     mediaConcurrency: intEnv('WA_MEDIA_CONCURRENCY', 10, 1),
     deviceName: deviceNameEnv(),

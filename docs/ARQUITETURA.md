@@ -119,6 +119,9 @@ Docker), vira aviso no log, nunca falha de boot.
 | `WA_SEND_MAX_DELAY_MS` | `45000` | teto do delay humano por envio |
 | `WA_DRAFT_TTL_MS` | `300000` | validade do confirm token (5 min) |
 | `WA_SENDS_PER_HOUR` | `10` | rate limit global de envios |
+| `WA_SENDS_PER_DAY` | `40` | teto de envios em 24h, somando todas as conversas |
+| `WA_NEW_CONTACTS_PER_DAY` | `3` | primeiros contatos (quem nunca conversou com você) em 24h; `0` não deixa iniciar conversa |
+| `WA_CHAT_MIN_INTERVAL_SECONDS` | `30` | intervalo mínimo entre envios para a mesma conversa (`0` desliga) |
 | `WA_HISTORY_DAYS` | `7` | dias de histórico importados no pareamento (`0` desliga) |
 | `WA_DEVICE_NAME` | `wa-bridge` | nome em "Aparelhos conectados" no celular (até 40 caracteres); só vale no próximo pareamento |
 | `WA_MEDIA_CONCURRENCY` | `10` | teto de mídias processando ao mesmo tempo (cada whisper carrega o modelo) |
@@ -245,7 +248,7 @@ export class WhatsAppConnection {
             quoted?: WAMessage, mentions?: string[]): Promise<string>;
   getGroupParticipants(jid: string,
     opts?: { refresh?: boolean; maxAgeMs?: number }): Promise<GroupParticipant[]>;
-  setPresence(chatJid: string, p: 'composing' | 'paused' | 'available'): Promise<void>;
+  setPresence(chatJid: string, p: 'composing' | 'paused'): Promise<void>;  // nunca available
   markRead(chatJid: string): Promise<void>;
   react(chatJid: string, messageId: string, emoji: string): Promise<void>;
   getRawMessage(messageId: string): WAMessageContent | null;     // para o processador de mídia
@@ -402,8 +405,21 @@ Invariantes do gate — **quebrar qualquer um destes é falha de segurança**:
    exige `acknowledge: ['NEVER_CONTACTED']` no body. Esse é o caso de número
    alucinado e de contato não solicitado (o padrão que o WhatsApp pune).
 5. Quiet hours → `warnings` inclui `QUIET_HOURS`, confirm exige `urgent: true`.
-6. Sem envio em massa: no máximo **1 draft ativo por chat** e um rate limit de
-   **10 envios/hora global**. Estourar é 429, não fila.
+6. Sem envio em massa: no máximo **1 draft ativo por chat** e limites de volume,
+   checados no draft e de novo no confirm. Estourar é 429 `RATE_LIMITED`, não fila, com
+   `detail.scope` dizendo qual limite foi:
+   - `hour`: `WA_SENDS_PER_HOUR` (10) envios na última hora, somando todas as conversas;
+   - `day`: `WA_SENDS_PER_DAY` (40) nas últimas 24h;
+   - `chat`: menos de `WA_CHAT_MIN_INTERVAL_SECONDS` (30) desde o último envio para a mesma
+     conversa. Só no confirm (no draft travaria o agente enquanto o humano lê), vem com
+     `detail.retryAfterMs`, e o token continua valendo;
+   - `new_contacts`: `WA_NEW_CONTACTS_PER_DAY` (3) primeiros contatos em 24h, contados por
+     `sends.first_contact` (`0` não deixa iniciar conversa);
+   - `whatsapp_quota`: a cota de conversas novas que o próprio WhatsApp manda
+     (`message-capping.update`) está em `CAPPED` ou com 10% ou menos sobrando (mínimo 1).
+     Fica em memória até o fim do ciclo; conta sem restrição pode nunca receber.
+   Nenhum desses limites garante nada contra banimento: as regras do WhatsApp não são
+   públicas, e eles só tiram do caminho rajada, volume alto e conversa nova em série.
 7. O preview retornado contém nome resolvido, número mascarado (só os 4 últimos
    dígitos visíveis), último contato e o texto exato de cada bubble.
 8. Menção (`mentions`) só em grupo, e **só para quem está no grupo**: o
@@ -448,7 +464,7 @@ que não notifica ninguém. Regras:
 export function splitBubbles(text: string): string[];
 export function planDelay(bubbles: string[], seed?: number): DelayPlan;
 export async function executePlan(plan: DelayPlan, io: {
-  presence: (p: 'composing' | 'paused' | 'available') => Promise<void>;
+  presence: (p: 'composing' | 'paused') => Promise<void>;
   send: (bubble: string) => Promise<string>;
   shouldAbort: () => boolean;
 }): Promise<string[]>;
@@ -461,7 +477,9 @@ aborto; não documente como proteção contra banimento):
 - digitação: ~5 chars/s, **jitter log-normal** (σ≈0.25), teto de 20000ms por bubble
 - pausa entre bubbles: 800–2500ms
 - `composing` reemitido a cada 8000ms (expira no WhatsApp)
-- `paused` entre bubbles, `available` ao final
+- `paused` entre bubbles, ao final e ao abortar. **Nunca `available`**: o socket sobe com
+  `markOnlineOnConnect: false` e o daemon nunca aparece online, porque um aparelho online
+  faz o celular parar de notificar
 - total limitado por `WA_SEND_MAX_DELAY_MS`; se o plano estourar, comprime
   proporcionalmente em vez de truncar texto
 - `shouldAbort()` é consultado antes de CADA bubble — é o que faz `wa_cancel` funcionar
@@ -614,6 +632,7 @@ passo já publicado.
 | 1 | schema acima (idempotente) + coluna `contacts.phone_jid` |
 | 2 | `idx_messages_ts` + índice de busca FTS5 (abaixo), com `rebuild` do que já existia |
 | 3 | apaga as `unknown` que são `protocolMessage` de sincronização entre aparelhos, gravadas antes do filtro de entrada |
+| 4 | coluna `sends.first_contact` (idempotente), que o limite de conversas novas por dia conta |
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);

@@ -214,6 +214,20 @@ export interface MentionPreview {
 
 export type SendWarning = 'NEVER_CONTACTED' | 'QUIET_HOURS' | 'GROUP_CHAT' | 'LARGE_TEXT';
 
+/**
+ * Cota de conversas novas que o próprio WhatsApp informa à conta (`message-capping.update`
+ * do Baileys 7). Só existe depois que o servidor manda; contas sem restrição podem nunca
+ * receber. `status` é o `capping_status` dele (`NONE`, `FIRST_WARNING`, `SECOND_WARNING`,
+ * `CAPPED`).
+ */
+export interface NewChatQuota {
+  total: number | null;
+  used: number | null;
+  status: string | null;
+  cycleEndsAt: number | null;
+  receivedAt: number;
+}
+
 /** Rascunho devolvido ao agente, para o humano revisar antes de confirmar. */
 export interface SendDraft {
   confirmToken: string;

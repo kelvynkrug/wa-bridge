@@ -52,6 +52,8 @@ export interface SendRecord {
   bubblesSent: number | null;
   cancelled: boolean;
   messageIdsJson: string | null;
+  /** Primeira mensagem para quem nunca conversou com o usuário: conta no limite diário. */
+  firstContact: boolean;
 }
 
 /** Linha bruta de `messages`, antes da conversão de inteiros para boolean. */
@@ -151,6 +153,7 @@ interface SendRow {
   bubbles_sent: number | null;
   cancelled: number;
   message_ids_json: string | null;
+  first_contact: number;
 }
 
 interface AuditRow {
@@ -341,6 +344,7 @@ function rowToSend(row: SendRow): SendRecord {
     bubblesSent: row.bubbles_sent,
     cancelled: row.cancelled === 1,
     messageIdsJson: row.message_ids_json,
+    firstContact: row.first_contact === 1,
   };
 }
 
@@ -415,6 +419,7 @@ export class Store {
       () => this.migrateBaseSchema(),
       () => this.migrateSearchIndex(),
       () => this.migrateDropDeviceSyncMessages(),
+      () => this.migrateSendFirstContact(),
     ];
     const row = this.db.prepare('PRAGMA user_version').get() as unknown as { user_version: number };
     for (let target = Number(row.user_version) + 1; target <= steps.length; target += 1) {
@@ -574,6 +579,13 @@ export class Store {
       dropEmpty.run(jid, jid);
       refresh.run(jid, jid);
     }
+  }
+
+  /** Passo 4: `sends.first_contact`, que o limite diário de conversas novas conta. */
+  private migrateSendFirstContact(): void {
+    const columns = this.db.prepare('PRAGMA table_info(sends)').all() as unknown as Array<{ name: string }>;
+    if (columns.some((c) => c.name === 'first_contact')) return;
+    this.db.exec('ALTER TABLE sends ADD COLUMN first_contact INTEGER NOT NULL DEFAULT 0');
   }
 
   /** Fecha o banco. Depois disto nenhum método do Store funciona. */
@@ -1245,8 +1257,8 @@ export class Store {
   insertSend(s: SendRecord): void {
     this.prepare(
       `INSERT INTO sends (send_id, chat_jid, agent, trace_id, started_at, finished_at,
-         stage, bubbles_total, bubbles_sent, cancelled, message_ids_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         stage, bubbles_total, bubbles_sent, cancelled, message_ids_json, first_contact)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       s.sendId,
       s.chatJid,
@@ -1259,6 +1271,7 @@ export class Store {
       s.bubblesSent,
       s.cancelled ? 1 : 0,
       s.messageIdsJson,
+      s.firstContact ? 1 : 0,
     );
   }
 
@@ -1303,6 +1316,22 @@ export class Store {
       n: number;
     };
     return row.n;
+  }
+
+  /** Envios de primeiro contato (`first_contact`) desde `since`. */
+  countFirstContactSendsSince(since: number): number {
+    const row = this.prepare('SELECT COUNT(*) AS n FROM sends WHERE started_at >= ? AND first_contact = 1').get(
+      since,
+    ) as unknown as { n: number };
+    return row.n;
+  }
+
+  /** Início do envio mais recente para a conversa, ou `null` se nunca houve. */
+  lastSendToChatAt(chatJid: string): number | null {
+    const row = this.prepare('SELECT MAX(started_at) AS ts FROM sends WHERE chat_jid = ?').get(chatJid) as unknown as {
+      ts: number | null;
+    };
+    return row.ts ?? null;
   }
 
   // ------------------------------------------------------------------ audit

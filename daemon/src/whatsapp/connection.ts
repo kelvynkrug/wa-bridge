@@ -22,7 +22,7 @@ import makeWASocket, {
   type WASocket,
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
-import type { GroupParticipant, Logger, MessageType, SessionState, StoredMessage } from '../types.js';
+import type { GroupParticipant, Logger, MessageType, NewChatQuota, SessionState, StoredMessage } from '../types.js';
 import type { Store } from '../store/store.js';
 import { isDeviceSyncProtocolType } from './protocol.js';
 
@@ -62,6 +62,25 @@ type IngestSource = 'live' | 'offline' | 'history';
 /** Status, newsletter e listas de transmissão não são conversa: ficam fora do histórico. */
 function isBroadcastJid(jid: string): boolean {
   return jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter');
+}
+
+/**
+ * Normaliza o `message-capping.update`: os números vêm como número ou texto, e o fim do
+ * ciclo em segundos ou milissegundos.
+ */
+export function toNewChatQuota(info: Record<string, unknown>, receivedAt: number): NewChatQuota {
+  const num = (v: unknown): number | null => {
+    const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : typeof v === 'number' ? v : NaN;
+    return Number.isFinite(n) ? n : null;
+  };
+  const cycleEnd = num(info.cycle_end_timestamp);
+  return {
+    total: num(info.total_quota),
+    used: num(info.used_quota),
+    status: typeof info.capping_status === 'string' ? info.capping_status : null,
+    cycleEndsAt: cycleEnd === null ? null : cycleEnd < 1e12 ? cycleEnd * 1000 : cycleEnd,
+    receivedAt,
+  };
 }
 
 /**
@@ -280,6 +299,8 @@ export class WhatsAppConnection {
   private readonly subscribedPresence = new Set<string>();
   private readonly rawMessages = new LruCache<WAMessageContent>(RAW_MESSAGE_CACHE_LIMIT);
   private readonly listeners: Array<(m: StoredMessage, raw: WAMessageContent) => void> = [];
+  /** Última cota de conversas novas que o WhatsApp mandou; some quando o ciclo acaba. */
+  private newChatQuota: NewChatQuota | null = null;
 
   constructor(deps: WhatsAppConnectionDeps) {
     this.store = deps.store;
@@ -316,6 +337,10 @@ export class WhatsAppConnection {
         { level: this.log.level === 'debug' || this.log.level === 'trace' ? this.log.level : 'warn' },
       ),
       version,
+      // O padrão do Baileys marca a conta como online ao conectar. Com um aparelho online o
+      // celular para de notificar, e o daemon fica conectado o tempo todo: o celular do
+      // usuário nunca mais tocaria. O daemon só recebe e lê sob demanda, sem aparecer online.
+      markOnlineOnConnect: false,
       // O primeiro item vira o nome em "Aparelhos conectados" ("Google Chrome (wa-bridge)"),
       // para não confundir com o WhatsApp Web do próprio usuário. O celular grava o nome no
       // pareamento: trocar aqui só aparece depois de parear de novo.
@@ -334,6 +359,14 @@ export class WhatsAppConnection {
     this.socket = socket;
 
     socket.ev.on('creds.update', saveCreds);
+
+    // O WhatsApp avisa quantas conversas novas a conta ainda pode iniciar no ciclo. O gate
+    // usa isso para parar antes do limite dele, não depois.
+    socket.ev.on('message-capping.update', (info) => {
+      if (socket !== this.socket) return;
+      this.newChatQuota = toNewChatQuota(info as unknown as Record<string, unknown>, Date.now());
+      this.log.info({ cota: this.newChatQuota }, 'cota de conversas novas do WhatsApp atualizada');
+    });
 
     // Grupo renomeado, ou entrada em grupo novo: mantém `chats.name` atual sem precisar
     // de um novo sync completo.
@@ -796,6 +829,14 @@ export class WhatsAppConnection {
     return this.sessionState;
   }
 
+  /** Cota de conversas novas vigente, ou `null` se o WhatsApp nunca mandou ou o ciclo acabou. */
+  getNewChatQuota(now = Date.now()): NewChatQuota | null {
+    const quota = this.newChatQuota;
+    if (!quota) return null;
+    if (quota.cycleEndsAt !== null && quota.cycleEndsAt <= now) return null;
+    return quota;
+  }
+
   /**
    * Desvincula o aparelho atual, apaga as credenciais salvas e reconecta para gerar um QR
    * novo.
@@ -978,8 +1019,11 @@ export class WhatsAppConnection {
     return { document: url, mimetype: mime, fileName: filePath.split('/').pop() ?? 'arquivo', caption };
   }
 
-  /** Atualiza a presença (`composing`/`paused`/`available`) em um chat. */
-  async setPresence(chatJid: string, p: 'composing' | 'paused' | 'available'): Promise<void> {
+  /**
+   * Atualiza o estado de digitação (`composing`/`paused`) em um chat. Não aceita
+   * `available`: a conta online faz o celular parar de notificar.
+   */
+  async setPresence(chatJid: string, p: 'composing' | 'paused'): Promise<void> {
     const socket = this.requireSocket();
     await this.ensurePresenceSubscribed(socket, chatJid);
     await socket.sendPresenceUpdate(p, chatJid);

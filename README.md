@@ -181,8 +181,14 @@ falando. Nunca compartilhe `auth/` entre instâncias.
 - **API só em `127.0.0.1`**, com token Bearer. O painel estático abre sem token, mas
   todo dado exige token.
 - **Auditoria append-only** de todo rascunho, envio, bloqueio e cancelamento.
-- A digitação simulada existe para quem recebe e para dar tempo de cancelar. **Não é
-  proteção contra banimento**: não existe proteção contra banimento.
+- **Nunca aparece online.** O daemon conecta sem se marcar como disponível e, ao enviar,
+  só mostra "digitando" na conversa. Um aparelho online faz o celular parar de notificar.
+- **Limites de volume**: 10 envios por hora, 40 por dia, 30s entre envios para a mesma
+  conversa e 3 conversas novas por dia, além de respeitar a cota de conversas novas que o
+  próprio WhatsApp informa. Tudo ajustável no `.env`.
+- A digitação simulada existe para quem recebe e para dar tempo de cancelar. **Nada aqui é
+  proteção garantida contra banimento**: as regras do WhatsApp não são públicas. Os limites
+  só tiram do caminho os padrões que mais chamam atenção.
 
 ## Docker
 
