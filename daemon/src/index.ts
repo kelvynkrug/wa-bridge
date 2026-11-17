@@ -8,6 +8,7 @@ import { MediaProcessor } from './media/processor.js';
 import { Audit } from './obs/audit.js';
 import { createLogger } from './obs/log.js';
 import { Metrics } from './obs/metrics.js';
+import { StatusProvider } from './obs/status.js';
 import { SendGate } from './send/gate.js';
 import { RETENTION_INTERVAL_MS, runRetention } from './store/retention.js';
 import { Store } from './store/store.js';
@@ -46,8 +47,10 @@ async function main(): Promise<void> {
   const media = new MediaProcessor({ wa, store, log, home: config.home, config });
   const gate = new SendGate({ wa, store, log, metrics, audit, config });
 
+  const status = new StatusProvider({ config, store, media, events });
+
   // 5. HTTP só sobe depois que tudo existe, para nunca servir 500 por dependência nula.
-  const api = await createApi({ config, store, wa, media, gate, metrics, audit, events, log });
+  const api = await createApi({ config, store, wa, media, gate, metrics, audit, events, status, log });
 
   // Mensagem nova (ao vivo ou da fila offline) vai para o stream `/events`. Histórico
   // importado no pareamento não passa por `onMessage`.
@@ -57,7 +60,9 @@ async function main(): Promise<void> {
 
   // Retenção no boot e a cada 6h. Falha aqui nunca derruba o daemon.
   const retention = (): void => {
-    runRetention({ store, log, config }).catch((error: unknown) => log.error({ error }, 'falha na retenção'));
+    runRetention({ store, log, config })
+      .then((result) => status.recordRetention(result))
+      .catch((error: unknown) => log.error({ error }, 'falha na retenção'));
   };
   retention();
   const retentionTimer = setInterval(retention, RETENTION_INTERVAL_MS);

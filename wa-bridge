@@ -540,7 +540,7 @@ cmd_pair() {
   fi
   if [[ -n "$(health_json)" ]]; then
     # Daemon de pé: ele mesmo apaga a credencial e gera o QR, sem reiniciar o processo.
-    curl -fsS -m 10 -X POST -H "Authorization: Bearer $(read_token)" "$URL/session/pair" >/dev/null
+    curl -fsS -m 10 -X POST -H "X-WA-Agent: cli" -H "Authorization: Bearer $(read_token)" "$URL/session/pair" >/dev/null
   else
     rm -rf "$HOME_DIR/auth"
     cmd_start
@@ -553,7 +553,7 @@ cmd_qr() {
   local token; token="$(read_token)" || { fail "token não existe — suba o daemon: ./wa-bridge start"; return 1; }
   local node; node="$(node_bin)" || return 1
   local out="$HOME_DIR/qr.png" session
-  session="$(curl -fsS -m 5 -H "Authorization: Bearer $token" "$URL/session" 2>/dev/null)" \
+  session="$(curl -fsS -m 5 -H "X-WA-Agent: cli" -H "Authorization: Bearer $token" "$URL/session" 2>/dev/null)" \
     || { fail "daemon não responde em $URL — rode: ./wa-bridge start"; return 1; }
   if ! printf '%s' "$session" | "$node" -e '
       let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {

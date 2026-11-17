@@ -51,8 +51,10 @@ O que vem junto:
   conversa; blocklist.
 - **Digitação simulada**: o envio aparece como "digitando...", quebrado em balões, com
   uma janela para cancelar antes de terminar.
-- **Painel** em `http://127.0.0.1:7788/dashboard/`: QR de pareamento, estado da sessão,
-  métricas por agente e trilha de auditoria de todo envio.
+- **Painel** em `http://127.0.0.1:7788/dashboard/` (`./wa-bridge open`): sessão e QR de
+  pareamento, envios usados na hora e horário de silêncio, rascunhos esperando aprovação
+  (dá para descartar), envios em andamento (dá para cancelar), mensagens chegando ao vivo,
+  busca com ⌘K, métricas por agente e por tool, auditoria e a saúde da instalação.
 
 ## Instalar
 

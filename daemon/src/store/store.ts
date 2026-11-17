@@ -1194,6 +1194,14 @@ export class Store {
     return row ? rowToDraft(row) : null;
   }
 
+  /** Rascunhos ainda pendentes e não expirados, mais antigos primeiro (para o painel). */
+  listPendingDrafts(now: number): DraftRecord[] {
+    const rows = this.prepare(
+      `SELECT * FROM drafts WHERE status = 'pending' AND expires_at > ? ORDER BY created_at`,
+    ).all(now) as unknown as DraftRow[];
+    return rows.map(rowToDraft);
+  }
+
   // ------------------------------------------------------------------ sends
 
   /** Registra o início de um envio (plano de delay humano). */

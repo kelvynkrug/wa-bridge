@@ -184,6 +184,11 @@ export class MediaProcessor {
     return job;
   }
 
+  /** Ocupação da fila de mídia, para o painel. */
+  queueStats(): { running: number; queued: number; max: number } {
+    return { running: this.limiter.running, queued: this.limiter.queued, max: this.config.mediaConcurrency };
+  }
+
   /** Implementação de fato de `materialize`, sem a lógica de deduplicação de chamadas. */
   private async doMaterialize(
     messageId: string,

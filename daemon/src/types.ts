@@ -295,18 +295,22 @@ export interface AuditEvent {
 }
 
 /** Agregados que alimentam o dashboard. */
+export interface MetricsTotals {
+  calls: number;
+  errors: number;
+  sends: number;
+  cancels: number;
+  blocked: number;
+  mediaProcessed: number;
+  messagesRead: number;
+}
+
 export interface MetricsSummary {
   windowMs: number;
   generatedAt: number;
-  totals: {
-    calls: number;
-    errors: number;
-    sends: number;
-    cancels: number;
-    blocked: number;
-    mediaProcessed: number;
-    messagesRead: number;
-  };
+  totals: MetricsTotals;
+  /** Mesmos totais na janela imediatamente anterior, para o painel mostrar a variação. */
+  previousTotals: MetricsTotals;
   byAgent: {
     agent: string;
     calls: number;
@@ -314,8 +318,50 @@ export interface MetricsSummary {
     sends: number;
     p50Ms: number;
     p95Ms: number;
+    /** Última chamada do agente na janela (epoch ms), ou `null` se só há auditoria. */
+    lastCallAt: number | null;
   }[];
   byTool: { tool: string; calls: number; errors: number; p95Ms: number }[];
   timeline: { bucketTs: number; calls: number; sends: number; errors: number }[];
   session: SessionState;
+}
+
+// --------------------------------------------------------------- painel
+
+/** Rascunho pendente como o painel enxerga: sem o token de confirmação. */
+export interface PendingDraftView {
+  /** Id opaco (hash do token), suficiente para descartar e inútil para confirmar. */
+  id: string;
+  chatJid: string;
+  name: string | null;
+  maskedNumber: string;
+  bubbles: string[];
+  mediaPath: string | null;
+  warnings: SendWarning[];
+  mentions: number;
+  agent: string | null;
+  createdAt: number;
+  expiresAt: number;
+}
+
+/** Envio em execução (delay humano rodando), cancelável pelo `sendId`. */
+export interface ActiveSendView {
+  sendId: string;
+  chatJid: string;
+  name: string | null;
+  stage: string;
+  bubblesTotal: number;
+  bubblesSent: number;
+  agent: string | null;
+  startedAt: number;
+}
+
+/** Retrato do gate de envio para o painel (`GET /gate`). */
+export interface GateSnapshot {
+  sendsLastHour: number;
+  sendsPerHour: number;
+  quietHours: { active: boolean; window: string };
+  draftTtlMs: number;
+  drafts: PendingDraftView[];
+  sends: ActiveSendView[];
 }

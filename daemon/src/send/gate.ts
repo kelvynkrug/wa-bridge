@@ -3,13 +3,22 @@
  * (consumo único do token). Esta é a parte mais sensível do daemon — ver os
  * invariantes de segurança em docs/ARQUITETURA.md ("Gate de envio").
  */
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { isQuietHour, maskNumber, type Config } from '../config.js';
 import type { Audit } from '../obs/audit.js';
 import type { Metrics } from '../obs/metrics.js';
 import type { DraftRecord, Store } from '../store/store.js';
-import type { DraftInput, Logger, MentionPreview, SendDraft, SendWarning } from '../types.js';
+import type {
+  ActiveSendView,
+  DraftInput,
+  GateSnapshot,
+  Logger,
+  MentionPreview,
+  PendingDraftView,
+  SendDraft,
+  SendWarning,
+} from '../types.js';
 import type { WhatsAppConnection } from '../whatsapp/connection.js';
 import { isBlocked as isBlockedJid } from './blocklist.js';
 import { AppError } from './errors.js';
@@ -47,6 +56,14 @@ interface DraftPayload {
   mentions: ResolvedMention[];
   warnings: SendWarning[];
   estimatedDelayMs: number;
+}
+
+/**
+ * Id que o painel usa para um rascunho: hash do token de confirmação. Serve para
+ * descartar e não serve para confirmar, então o token nunca precisa sair do gate.
+ */
+export function draftIdFor(confirmToken: string): string {
+  return createHash('sha256').update(confirmToken).digest('hex').slice(0, 16);
 }
 
 /** Estado de aborto em memória para um envio em andamento (o processo é único). */
@@ -620,6 +637,61 @@ export class SendGate {
       detail: { stage: 'draft', discarded },
     });
     return { discarded };
+  }
+
+  /**
+   * Retrato do gate para o painel: uso do limite por hora, horário de silêncio,
+   * rascunhos esperando aprovação (sem o token) e envios em execução.
+   */
+  snapshot(now: number = Date.now()): GateSnapshot {
+    const drafts: PendingDraftView[] = this.store.listPendingDrafts(now).map((d) => {
+      const payload = JSON.parse(d.payloadJson) as DraftPayload;
+      return {
+        id: draftIdFor(d.confirmToken),
+        chatJid: d.chatJid,
+        name: this.store.getChatName(d.chatJid),
+        maskedNumber: maskNumber(this.store.phoneFor(d.chatJid)),
+        bubbles: payload.bubbles,
+        mediaPath: payload.mediaPath,
+        warnings: payload.warnings,
+        mentions: payload.mentions?.length ?? 0,
+        agent: d.agent,
+        createdAt: d.createdAt,
+        expiresAt: d.expiresAt,
+      };
+    });
+    // Em execução é quem tem abort flag em memória: o `stage` do banco de um envio que
+    // morreu com o processo anterior não volta a andar.
+    const sends: ActiveSendView[] = [];
+    for (const sendId of this.abortFlags.keys()) {
+      const s = this.store.getSend(sendId);
+      if (!s) continue;
+      sends.push({
+        sendId: s.sendId,
+        chatJid: s.chatJid,
+        name: this.store.getChatName(s.chatJid),
+        stage: s.stage,
+        bubblesTotal: s.bubblesTotal ?? 0,
+        bubblesSent: s.bubblesSent ?? 0,
+        agent: s.agent,
+        startedAt: s.startedAt,
+      });
+    }
+    return {
+      sendsLastHour: this.store.countSendsSince(now - ONE_HOUR_MS),
+      sendsPerHour: this.config.sendsPerHour,
+      quietHours: { active: isQuietHour(this.config, new Date(now)), window: this.config.quietHours.raw },
+      draftTtlMs: this.config.draftTtlMs,
+      drafts,
+      sends,
+    };
+  }
+
+  /** Descarta um rascunho pelo id do painel (`draftIdFor`), sem expor o token de confirmação. */
+  async discardDraftById(id: string, ctx: CallCtx = {}): Promise<{ discarded: boolean }> {
+    const draft = this.store.listPendingDrafts(Date.now()).find((d) => draftIdFor(d.confirmToken) === id);
+    if (!draft) throw new AppError('DRAFT_NOT_FOUND', 404, 'rascunho não encontrado ou já expirado');
+    return this.discardDraft(draft.confirmToken, ctx);
   }
 
   /** Marca o abort flag de um envio em andamento; `shouldAbort()` do plano em execução o vê. */

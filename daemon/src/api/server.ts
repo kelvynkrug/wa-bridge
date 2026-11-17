@@ -14,6 +14,7 @@ import type { EventHub } from '../events/hub.js';
 import type { MediaProcessor } from '../media/processor.js';
 import type { Audit } from '../obs/audit.js';
 import type { Metrics } from '../obs/metrics.js';
+import type { StatusProvider } from '../obs/status.js';
 import type { SendGate } from '../send/gate.js';
 import { AppError } from '../send/errors.js';
 import { toFtsQuery, type Store } from '../store/store.js';
@@ -36,6 +37,8 @@ declare module 'fastify' {
     traceId: string;
     /** Agente chamador, já sanitizado (nunca confiar no header bruto). */
     callAgent: string;
+    /** Tool MCP que originou a chamada (`X-WA-Tool`), já sanitizada; `null` fora do shim. */
+    callTool: string | null;
     /** Timestamp monotônico (ns) do início da requisição, para medir duração. */
     startedAtNs: bigint;
     /** Mensagem de erro (se houve) para alimentar `metrics.recordCall`. */
@@ -53,6 +56,7 @@ export interface ApiDeps {
   metrics: Metrics;
   audit: Audit;
   events: EventHub;
+  status: StatusProvider;
   log: Logger;
 }
 
@@ -62,6 +66,27 @@ const SEARCH_MAX_LIMIT = 100;
 const AGENT_HEADER = 'x-wa-agent';
 const AGENT_MAX_LEN = 48;
 const AGENT_RE = /^[A-Za-z0-9._-]+$/;
+const TOOL_HEADER = 'x-wa-tool';
+const TOOL_RE = /^wa_[a-z_]{1,40}$/;
+
+/** Agente com que o painel se identifica; as chamadas dele não entram nas métricas. */
+export const DASHBOARD_AGENT = 'dashboard';
+
+/**
+ * Diz se uma chamada entra nas métricas. Ficam de fora o próprio painel (que consulta a
+ * cada 10s e virava quase todo o "uso"), os arquivos estáticos dele, o healthcheck e o
+ * stream `/events` (conexão longa que apareceria como chamada lenta).
+ */
+export function shouldRecordCall(route: string, agent: string): boolean {
+  if (agent === DASHBOARD_AGENT) return false;
+  if (route === '/health' || route === '/events') return false;
+  return route !== '/dashboard' && !route.startsWith('/dashboard/');
+}
+
+/** Sanitiza o header `X-WA-Tool`: só nomes de tool do shim (`wa_*`), senão `null`. */
+export function sanitizeTool(raw: unknown): string | null {
+  return typeof raw === 'string' && TOOL_RE.test(raw) ? raw : null;
+}
 
 /** Sanitiza o header `X-WA-Agent`: até 48 chars de `[A-Za-z0-9._-]`, senão cai para "unknown". */
 function sanitizeAgent(raw: unknown): string {
@@ -89,7 +114,7 @@ function resolveDashboardDir(): string {
 
 /** Monta a instância Fastify com todas as rotas do contrato. Quem chama `listen` é o `index.ts`. */
 export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
-  const { config, store, wa, media, gate, metrics, audit, events, log } = deps;
+  const { config, store, wa, media, gate, metrics, audit, events, status, log } = deps;
 
   const app = Fastify({
     logger: false,
@@ -115,6 +140,7 @@ export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
     req.traceId = randomUUID();
     req.apiError = null;
     req.callAgent = sanitizeAgent(req.headers[AGENT_HEADER]);
+    req.callTool = sanitizeTool(req.headers[TOOL_HEADER]);
     reply.header('X-Trace-Id', req.traceId);
 
     if (req.url === '/health' || req.url.startsWith('/health?')) return;
@@ -134,6 +160,8 @@ export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
 
   // --------------------------------------------------------------- métricas
   app.addHook('onResponse', async (req: FastifyRequest, reply: FastifyReply) => {
+    const route = req.routeOptions.url ?? req.url;
+    if (!shouldRecordCall(route, req.callAgent)) return;
     const durationMs = Number(process.hrtime.bigint() - req.startedAtNs) / 1e6;
     const statusCode = reply.statusCode;
     const status: CallStatus = statusCode === 401 || statusCode === 403 || statusCode === 429
@@ -141,7 +169,8 @@ export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
       : statusCode >= 400
         ? 'error'
         : 'ok';
-    const tool = req.routeOptions.url ?? req.url;
+    // Com o shim, registra o nome da tool (`wa_read_messages`); fora dele, a rota HTTP.
+    const tool = req.callTool ?? route;
     metrics.recordCall({
       ts: Date.now(),
       traceId: req.traceId,
@@ -366,6 +395,20 @@ export async function createApi(deps: ApiDeps): Promise<FastifyInstance> {
     const confirmToken = requireString(body, 'confirmToken');
     return gate.discardDraft(confirmToken, { agent: req.callAgent, traceId: req.traceId });
   });
+
+  /**
+   * GET /gate: retrato do gate para o painel. Rascunhos vêm sem o token de confirmação,
+   * só com um id opaco que serve para descartar (e não para confirmar).
+   */
+  app.get('/gate', async () => gate.snapshot());
+
+  /** POST /gate/drafts/:id/discard: descarta um rascunho pelo id do painel. */
+  app.post<{ Params: { id: string } }>('/gate/drafts/:id/discard', async (req) =>
+    gate.discardDraftById(req.params.id, { agent: req.callAgent, traceId: req.traceId }),
+  );
+
+  /** GET /status: saúde da instalação (versão, banco, mídia, serviço, retenção, fila, streams). */
+  app.get('/status', async () => status.snapshot());
 
   /** POST /send/cancel — sinaliza o abort flag de um envio em andamento. */
   app.post('/send/cancel', async (req) => {

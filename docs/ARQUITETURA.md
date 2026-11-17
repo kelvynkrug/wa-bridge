@@ -35,7 +35,11 @@ e não contém nenhuma lógica de negócio — só traduz tool call → HTTP →
 - **DB**: `node:sqlite` nativo (sem `better-sqlite3`, sem dependência nativa).
 - **HTTP**: Fastify 5. **Logs**: Pino 10. **MCP**: `@modelcontextprotocol/sdk` 1.x.
 - **Mídia**: `ffmpeg` e `whisper-cli` do PATH (ou `FFMPEG_BIN`/`WHISPER_BIN`).
-- **Dashboard**: HTML+CSS+JS vanilla, **sem build e sem CDN**, SVG à mão.
+- **Dashboard**: HTML+CSS+JS vanilla, **sem build e sem CDN**, SVG à mão. Fontes do
+  sistema (sem arquivo de fonte externo). Atualiza a cada 10s com `X-WA-Agent: dashboard`
+  e lê o `/events` com `fetch` (o `EventSource` do navegador não manda o token). Todo texto
+  vindo do daemon entra por `textContent`, nunca `innerHTML`. `?mock=1|empty|error|pairing|close`
+  exercita cada estado sem o daemon (`dashboard/mock-data.js`).
 - **Dev**: `tsx` para rodar, `tsc` para build. Sem bundler.
 
 Nada de ORM, nada de framework de frontend. Zero dependência nativa. Docker é opcional
@@ -515,6 +519,21 @@ O `index.ts` liga `wa.onMessage` ao `publishMessage`, então só mensagem ao viv
 offline vira evento; histórico importado não. Cliente com mais de 1 MB acumulado sem ler é
 derrubado.
 
+### `daemon/src/obs/status.ts`
+
+```ts
+export function detectService(env?: NodeJS.ProcessEnv): string | null;
+export class StatusProvider {
+  constructor(deps: { config: Config; store: Store; media: MediaProcessor; events: EventHub });
+  recordRetention(result: RetentionResult, at?: number): void;   // o index.ts chama a cada rodada
+  snapshot(now?: number): Promise<StatusSnapshot>;               // GET /status
+}
+```
+
+O serviço é detectado pelo ambiente: o launchd põe o rótulo do job em `XPC_SERVICE_NAME`,
+o systemd define `INVOCATION_ID`, e o Docker deixa `/.dockerenv`. Nada do retrato é
+segredo: sem token, credencial nem número.
+
 ### Desligamento (`index.ts`)
 
 SIGTERM/SIGINT: `api.close()` (o `preClose` encerra os streams SSE, senão o close do HTTP
@@ -610,7 +629,16 @@ erro de sintaxe no MATCH.
 ## HTTP API (bind `127.0.0.1` sempre; `Authorization: Bearer <token>` em tudo menos `/health`)
 
 Header opcional `X-WA-Agent: <nome>` identifica o agente chamador; default `unknown`.
+Header opcional `X-WA-Tool: wa_<nome>` (o shim manda em toda chamada feita dentro de uma
+tool, via `AsyncLocalStorage`): as métricas registram o nome da tool em vez da rota HTTP.
+Valor fora de `^wa_[a-z_]{1,40}$` é ignorado.
 Toda resposta de erro: `{ error: { code: string, message: string, detail?: unknown } }`.
+
+**O que não entra nas métricas** (`shouldRecordCall`): chamadas do agente `dashboard` (o
+painel se identifica assim e consulta a cada 10s; antes virava quase todo o "uso"), os
+arquivos estáticos em `/dashboard/*`, o `/health` e o `/events` (conexão longa contaria
+como chamada lenta). `MetricsSummary` traz também `previousTotals` (mesmos totais na
+janela anterior, para a variação) e `byAgent[].lastCallAt`.
 
 | Método | Rota | Body / Query | Resposta |
 |---|---|---|---|
@@ -634,7 +662,19 @@ Toda resposta de erro: `{ error: { code: string, message: string, detail?: unkno
 | GET | `/metrics/calls` | `?limit=100` | `{ calls: CallRecord[] }` |
 | GET | `/metrics/audit` | `?limit=100` | `{ events: AuditEvent[] }` |
 | POST | `/send/discard` | `{ confirmToken }` | `{ discarded }` |
+| GET | `/gate` | — | `GateSnapshot`: `sendsLastHour`, `sendsPerHour`, `quietHours { active, window }`, `draftTtlMs`, `drafts: PendingDraftView[]`, `sends: ActiveSendView[]` |
+| POST | `/gate/drafts/:id/discard` | — | `{ discarded }`; `id` é `draftIdFor(token)`, 404 `DRAFT_NOT_FOUND` se não houver |
+| GET | `/status` | — | `StatusSnapshot`: versão, pid, Node, serviço (`launchd (<rótulo>)`, `systemd`, `docker` ou `null`), schema, tamanho do banco, mídia em disco (medida no máximo 1x/min), retenção com a última rodada, dias de histórico, fila de mídia, streams abertos, modelo do whisper e permissão da pasta de estado |
 | GET | `/dashboard` | — | painel (HTML estático) |
+
+### Painel e o token de confirmação
+
+O painel lista os rascunhos pendentes (`GET /gate`) e pode **descartar**, mas nunca
+**confirmar**: cada rascunho sai com um `id` que é o hash (sha256, 16 hex) do token de
+confirmação, e o token em si nunca aparece em `/gate`. Descartar pelo `id` passa pelo
+mesmo `discardDraft` do agente (com auditoria). Aprovar continua sendo só no agente, depois
+de mostrar o preview ao humano. Envios em andamento vêm dos `abortFlags` em memória e são
+canceláveis por `POST /send/cancel` com o `sendId`.
 
 ### Telefone real por trás de LID (`phoneJid` / `senderPhoneJid`)
 
