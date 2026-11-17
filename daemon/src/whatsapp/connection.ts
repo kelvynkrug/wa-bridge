@@ -20,7 +20,6 @@ import makeWASocket, {
   type WAMessageContent,
   type WAMessageKey,
   type WASocket,
-  type proto,
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import type { GroupParticipant, Logger, MessageType, SessionState, StoredMessage } from '../types.js';
@@ -65,24 +64,6 @@ function isBroadcastJid(jid: string): boolean {
 }
 
 /**
- * Decide se o Baileys baixa e processa uma notificação de histórico do celular.
- *
- * O padrão do Baileys 6.7.24 é processar só com `syncFullHistory`, que fica desligado
- * aqui: sem esta função, todo o histórico era descartado em silêncio. Aceita só bloco que
- * dá para baixar (`directPath`): os que o celular manda embutidos na mensagem (bootstrap,
- * status, nomes) falham nesta versão com "Cannot derive from empty media key", e as
- * mensagens vêm nos blocos `RECENT`. Também mantém o que o Baileys fazia ao conectar: a
- * consulta dele, sem `directPath`, responde não e ele não segura os eventos esperando
- * histórico.
- */
-export function shouldImportHistory(
-  historyDays: number,
-  notification: proto.Message.IHistorySyncNotification,
-): boolean {
-  return historyDays > 0 && Boolean(notification.directPath);
-}
-
-/**
  * `JSON.parse` que devolve `Buffer` onde o `JSON.stringify` gravou `{ type: 'Buffer', data }`.
  * O `raw_json` guarda chaves de mídia assim; para o Baileys reenviar uma mensagem, os
  * campos binários precisam voltar a ser bytes de verdade.
@@ -116,8 +97,8 @@ function normalizeJid(jid: string): string {
  * Converte um participante do `groupMetadata` no registro que persistimos.
  *
  * `id` é o identificador de endereçamento do grupo (telefone nos grupos antigos, LID
- * nos novos) e é o que precisa ir em `mentionedJid`. `jid` (quando vem) é o telefone
- * real, guardado só para o preview mostrar um número verdadeiro em vez do LID.
+ * nos novos) e é o que precisa ir em `mentionedJid`. `phoneNumber` (quando vem) é o
+ * telefone real, guardado só para o preview mostrar um número verdadeiro em vez do LID.
  */
 function toParticipantRecord(p: BaileysGroupParticipant): {
   jid: string;
@@ -126,7 +107,7 @@ function toParticipantRecord(p: BaileysGroupParticipant): {
   isAdmin: boolean;
 } {
   const jid = normalizeJid(p.id);
-  const phoneFromField = p.jid ? normalizeJid(p.jid) : null;
+  const phoneFromField = p.phoneNumber ? normalizeJid(p.phoneNumber) : null;
   const phoneJid = phoneFromField ?? (jid.endsWith('@s.whatsapp.net') ? jid : null);
   return {
     jid,
@@ -227,14 +208,19 @@ function guessMimeFromExt(filePath: string): string {
 }
 
 /**
- * Extrai de `key.senderPn` o telefone real por trás de um LID (`@lid`). O WhatsApp
- * passou a endereçar conversas por identificador opaco; sem este campo não há como
- * mostrar um número verdadeiro no preview do gate.
+ * Extrai da chave o telefone real por trás de um LID (`@lid`). O WhatsApp passou a
+ * endereçar conversas por identificador opaco; sem isso não há como mostrar um número
+ * verdadeiro no preview do gate. O Baileys 7 manda o outro endereço em `remoteJidAlt`
+ * (conversa) e `participantAlt` (grupo), que pode ser o telefone ou o LID: vale só o que
+ * termina em `@s.whatsapp.net`. `senderPn` e `participantPn` são do Baileys 6.
  */
 function extractSenderPn(raw: WAMessage): string | null {
   const key = raw.key as unknown as Record<string, unknown>;
-  const pn = key.senderPn ?? key.participantPn;
-  return typeof pn === 'string' && pn.length > 0 ? normalizeJid(pn) : null;
+  for (const field of ['senderPn', 'participantPn', 'remoteJidAlt', 'participantAlt']) {
+    const value = key[field];
+    if (typeof value === 'string' && value.endsWith('@s.whatsapp.net')) return normalizeJid(value);
+  }
+  return null;
 }
 
 /** Cache LRU simples por `Map` (ordem de inserção == ordem de acesso recente). */
@@ -332,7 +318,12 @@ export class WhatsAppConnection {
       // conseguiu decifrá-la e pede reenvio (e para decifrar voto de enquete). Devolver
       // `undefined` deixa a pessoa vendo "Aguardando mensagem" para sempre.
       getMessage: async (key) => this.lookupMessageContent(key.id),
-      shouldSyncHistoryMessage: (notification) => shouldImportHistory(this.historyDays, notification),
+      // O Baileys 7 liga a sincronização completa por padrão: o celular mandaria anos de
+      // conversa para o daemon descartar quase tudo (fica só `WA_HISTORY_DAYS`). Sem ela o
+      // celular ainda manda o histórico recente, que o padrão de `shouldSyncHistoryMessage`
+      // processa. Não sobrescreva essa função recusando tudo: o Baileys tira do histórico o
+      // mapeamento LID -> telefone e avisa no log que a sessão fica instável sem ele.
+      syncFullHistory: false,
     });
     this.socket = socket;
 

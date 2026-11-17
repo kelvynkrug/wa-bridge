@@ -247,12 +247,14 @@ Causas mais comuns de falha de pareamento, em ordem de probabilidade:
 
 ### Versão do Baileys
 
-Pinada em **`6.7.24`** (tag `legacy`) de propósito. A tag `latest` do pacote é um
-`7.0.0-rc` — não deve ser usada sem validar o pareamento manualmente primeiro, porque
-RCs de protocolo WhatsApp costumam introduzir quebras de pareamento sem aviso. Se o
-pareamento começar a falhar depois de uma atualização do WhatsApp (app ou protocolo), a
-**primeira coisa a testar** é subir a versão do Baileys (checando o changelog da tag
-antes de trocar), não reescrever a lógica de conexão.
+Pinada em **`7.0.0-rc14`**, versão exata. Ela ainda é um RC, mas trouxe o que a 6.7.24
+não tinha: reenvio automático de mensagem que não decifrou, leitura do histórico embutido
+no pareamento e o mapeamento LID -> telefone. Uma sessão pareada na 6.7.24 continua
+valendo na 7. Antes de trocar de versão, faça backup de `auth/` e do banco, e confira no
+log que a sessão abre e as mensagens chegam. Se o pareamento começar a falhar depois de
+uma atualização do WhatsApp (app ou protocolo), a **primeira coisa a testar** é subir a
+versão do Baileys (checando o changelog da tag antes de trocar), não reescrever a lógica
+de conexão.
 
 ## Onde olhar quando algo falha
 

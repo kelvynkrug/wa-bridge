@@ -13,7 +13,7 @@ import type { WAMessage, WAMessageContent } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { Store } from '../src/store/store.js';
 import type { StoredMessage } from '../src/types.js';
-import { shouldImportHistory, WhatsAppConnection } from '../src/whatsapp/connection.js';
+import { WhatsAppConnection } from '../src/whatsapp/connection.js';
 
 const DAY = 86_400_000;
 const ANA = '5551999998888@s.whatsapp.net';
@@ -198,13 +198,4 @@ test('close() impede reconexão', () => {
   wa.close();
   internals.scheduleReconnect();
   assert.equal(internals.reconnectTimer, null);
-});
-
-test('histórico: processa bloco baixável, ignora o embutido e respeita WA_HISTORY_DAYS=0', () => {
-  const recent = { syncType: 3, directPath: '/v/t62.7119-24/abc', chunkOrder: 1 };
-  const embutido = { syncType: 0, initialHistBootstrapInlinePayload: new Uint8Array([1, 2, 3]) };
-  assert.equal(shouldImportHistory(7, recent), true);
-  assert.equal(shouldImportHistory(7, embutido), false, 'bloco embutido falha no download do Baileys');
-  assert.equal(shouldImportHistory(0, recent), false);
-  assert.equal(shouldImportHistory(7, { syncType: 3 }), false, 'a consulta do Baileys no connect não segura eventos');
 });

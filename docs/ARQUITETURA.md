@@ -30,8 +30,8 @@ e não contém nenhuma lógica de negócio — só traduz tool call → HTTP →
 ## Stack
 
 - **Runtime**: Node 24 (ESM, `"type": "module"`), TypeScript 5.7 em strict.
-- **WhatsApp**: `@whiskeysockets/baileys` pinado em **`6.7.24`** (tag `legacy`;
-  a tag `latest` é um RC 7.0.0 e não deve ser usada sem validação de pareamento).
+- **WhatsApp**: `@whiskeysockets/baileys` pinado em **`7.0.0-rc14`** (tag `latest`),
+  versão exata, sem `^`: atualização só de propósito, validando a sessão.
 - **DB**: `node:sqlite` nativo (sem `better-sqlite3`, sem dependência nativa).
 - **HTTP**: Fastify 5. **Logs**: Pino 10. **MCP**: `@modelcontextprotocol/sdk` 1.x.
 - **Mídia**: `ffmpeg` e `whisper-cli` do PATH (ou `FFMPEG_BIN`/`WHISPER_BIN`).
@@ -267,11 +267,10 @@ Entrada de mensagens, por origem:
   lista de transmissão. Entra com `insertMessageIfNew`, **não** soma em não lidas, **não**
   dispara `onMessage` e não vai para o cache em memória. Também nomeia as conversas da
   janela. O WhatsApp só manda isso uma vez por pareamento: sessão que já estava pareada
-  só recebe o histórico pareando de novo. O Baileys 6.7.24 só baixa o histórico quando
-  `shouldSyncHistoryMessage` aceita (o padrão dele é `syncFullHistory`, desligado aqui), por
-  isso o socket recebe `shouldImportHistory`: aceita os blocos com `directPath` (os
-  `RECENT`, que trazem as mensagens) e recusa os embutidos na mensagem, que falham no
-  download desta versão.
+  só recebe o histórico pareando de novo. O socket sobe com `syncFullHistory: false` (o
+  Baileys 7 liga por padrão e o celular mandaria anos de conversa) e com o
+  `shouldSyncHistoryMessage` padrão, que processa tudo menos `FULL`. Recusar tudo nessa
+  função tira do Baileys o mapeamento LID -> telefone que vem no histórico.
 
 O timestamp pode vir como `Long`; a conversão usa o `toNumber` do Baileys (com
 `Number()` cru a mensagem ficava com a hora em que foi gravada).
