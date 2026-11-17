@@ -64,6 +64,8 @@ export interface Config {
   historyDays: number;
   /** Teto de mídias processadas (download, transcrição, keyframes) ao mesmo tempo. */
   mediaConcurrency: number;
+  /** Nome com que o daemon aparece em "Aparelhos conectados" no celular (só no pareamento). */
+  deviceName: string;
   retention: RetentionConfig;
   logLevel: string;
   version: string;
@@ -82,6 +84,19 @@ function parseQuietHours(raw: string): QuietHours {
     endMinute: Number(eh) * 60 + Number(em),
     raw: raw.trim(),
   };
+}
+
+/** Até onde o nome do aparelho cabe sem ser cortado na lista do celular. */
+const DEVICE_NAME_MAX = 40;
+
+/** Lê `WA_DEVICE_NAME`; ausente ou vazio usa `wa-bridge`, longo demais falha o boot. */
+function deviceNameEnv(): string {
+  const raw = process.env.WA_DEVICE_NAME?.trim();
+  if (!raw) return 'wa-bridge';
+  if (raw.length > DEVICE_NAME_MAX) {
+    throw new Error(`WA_DEVICE_NAME inválido: "${raw}" (máximo ${DEVICE_NAME_MAX} caracteres)`);
+  }
+  return raw;
 }
 
 /** Lê uma variável inteira `>= min`; ausente usa o default, inválida falha o boot. */
@@ -180,6 +195,7 @@ export function loadConfig(): Config {
     sendsPerHour: Number(process.env.WA_SENDS_PER_HOUR ?? 10),
     historyDays: intEnv('WA_HISTORY_DAYS', 7, 0),
     mediaConcurrency: intEnv('WA_MEDIA_CONCURRENCY', 10, 1),
+    deviceName: deviceNameEnv(),
     retention: {
       messagesDays: intEnv('WA_RETENTION_MESSAGES_DAYS', 0, 0),
       mediaDays: intEnv('WA_RETENTION_MEDIA_DAYS', 30, 0),

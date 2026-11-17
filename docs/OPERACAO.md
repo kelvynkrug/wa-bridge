@@ -218,7 +218,9 @@ journalctl --user -u wa-bridge -f                 # o log principal fica em ~/.w
 
 O caminho normal: `./wa-bridge start`, depois `./wa-bridge open` (painel já autenticado,
 com o QR) ou `./wa-bridge qr` (salva o QR como PNG e abre). No celular: WhatsApp >
-Aparelhos conectados > Conectar aparelho.
+Aparelhos conectados > Conectar aparelho. Na lista, o daemon aparece como
+**Google Chrome (wa-bridge)**, separado do WhatsApp Web; o nome vem de `WA_DEVICE_NAME` e
+o celular só o lê no pareamento.
 
 Causas mais comuns de falha de pareamento, em ordem de probabilidade:
 
@@ -236,7 +238,8 @@ Causas mais comuns de falha de pareamento, em ordem de probabilidade:
 4. **Credencial morta.** Depois de um logout no próprio celular, ou de ban, a pasta
    `auth/` fica com credenciais que nunca mais vão autenticar. O sintoma é reconectar
    em loop sem nunca abrir, ou `whatsapp: close` com "sessão deslogada". Solução:
-   `./wa-bridge pair` (faz backup de `auth/`, descarta a sessão e gera um QR novo).
+   `./wa-bridge pair` (desvincula o aparelho no celular, descarta a sessão e gera um QR
+   novo).
 5. **`device_removed` com a sessão recém-pareada.** Normalmente significa duas sessões
    Baileys concorrentes na mesma conta — confirme que só existe **um** processo do
    daemon rodando (`ps aux | grep index.js`, ou cheque se o serviço launchd/systemd e o

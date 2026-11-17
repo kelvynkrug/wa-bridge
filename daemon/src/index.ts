@@ -37,7 +37,14 @@ async function main(): Promise<void> {
   const events = new EventHub();
 
   // 3. Conexão WhatsApp. Única dona das credenciais e do socket.
-  const wa = new WhatsAppConnection({ store, log, metrics, home: config.home, historyDays: config.historyDays });
+  const wa = new WhatsAppConnection({
+    store,
+    log,
+    metrics,
+    home: config.home,
+    historyDays: config.historyDays,
+    deviceName: config.deviceName,
+  });
 
   // O `Metrics` não recebe a conexão no construtor (dependência circular), então o estado
   // da sessão chega por provider. Sem este wiring o dashboard mostra a sessão sempre fechada.

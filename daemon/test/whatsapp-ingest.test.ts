@@ -40,6 +40,7 @@ function connection(historyDays = 7): { wa: WhatsAppConnection; internals: Inter
     metrics: { recordCall: () => {} },
     home: dir,
     historyDays,
+    deviceName: 'wa-bridge',
   });
   wa.onMessage((m) => received.push(m));
   return { wa, internals: wa as unknown as Internals };

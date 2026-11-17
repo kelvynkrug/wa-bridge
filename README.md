@@ -82,7 +82,8 @@ cd wa-bridge
 ./wa-bridge open         # abre o painel com o QR
 ```
 
-No celular: **WhatsApp > Aparelhos conectados > Conectar aparelho** e escaneie o QR. A
+No celular: **WhatsApp > Aparelhos conectados > Conectar aparelho** e escaneie o QR. Na
+lista, o daemon aparece como **Google Chrome (wa-bridge)** (`WA_DEVICE_NAME`). A
 sessão fica salva em `~/.wa-bridge/auth/`; não precisa escanear de novo a cada boot.
 
 Modelo menor (mais rápido, transcreve pior): `./wa-bridge setup --model small`.
@@ -119,7 +120,7 @@ segurança).
 | `./wa-bridge status` | processo e estado da sessão do WhatsApp |
 | `./wa-bridge open` | abre o painel já autenticado |
 | `./wa-bridge qr` | salva o QR de pareamento como PNG e abre |
-| `./wa-bridge pair [--yes]` | descarta a sessão (com backup) e gera um QR novo |
+| `./wa-bridge pair [--yes]` | desvincula o aparelho no celular e gera um QR novo |
 | `./wa-bridge mcp-config` | config MCP pronta para cada agente |
 | `./wa-bridge logs` | acompanha os logs |
 | `./wa-bridge token` | copia o token da API |

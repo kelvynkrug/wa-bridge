@@ -8,7 +8,7 @@
 #   ./wa-bridge events [--from-me] [--chat JID]      acompanha as mensagens novas (stream)
 #   ./wa-bridge open                                 abre o painel já autenticado
 #   ./wa-bridge qr                                   salva e abre o QR de pareamento (PNG)
-#   ./wa-bridge pair [--yes]                         descarta a sessão e gera QR novo
+#   ./wa-bridge pair [--yes]                         desvincula o aparelho e gera QR novo
 #   ./wa-bridge mcp-config                           imprime a config MCP de cada agente
 #   ./wa-bridge token|doctor
 #
@@ -526,22 +526,24 @@ cmd_events() {
 cmd_pair() {
   local yes=0
   [[ "${1:-}" == "--yes" ]] && yes=1
-  warn "isto DESCARTA a sessão atual do WhatsApp e exige escanear um QR novo."
+  warn "isto DESVINCULA este aparelho do WhatsApp e exige escanear um QR novo."
   if (( ! yes )); then
     if [[ ! -t 0 ]]; then fail "sem terminal interativo: confirme com './wa-bridge pair --yes'"; return 1; fi
     read -r -p "confirma? [s/N] " answer
     [[ "$answer" == "s" || "$answer" == "S" ]] || { echo "cancelado"; return 0; }
   fi
-  # Backup antes: credencial pareada é cara de recuperar.
-  if [[ -d "$HOME_DIR/auth" ]] && [[ -n "$(ls -A "$HOME_DIR/auth" 2>/dev/null)" ]]; then
-    local backup; backup="$HOME_DIR/auth.backup-$(date +%Y%m%d-%H%M%S)"
-    cp -R "$HOME_DIR/auth" "$backup"
-    ok "backup da credencial atual em $backup"
-  fi
   if [[ -n "$(health_json)" ]]; then
-    # Daemon de pé: ele mesmo apaga a credencial e gera o QR, sem reiniciar o processo.
+    # Daemon de pé: ele faz logout (o aparelho sai da lista do celular), apaga a credencial
+    # e gera o QR, sem reiniciar o processo. Sem backup: depois do logout ela não vale mais.
     curl -fsS -m 10 -X POST -H "X-WA-Agent: cli" -H "Authorization: Bearer $(read_token)" "$URL/session/pair" >/dev/null
   else
+    # Daemon parado: sem conexão não há logout, então a credencial antiga ainda vale e vai
+    # para backup. O aparelho antigo fica no celular até ser removido à mão.
+    if [[ -d "$HOME_DIR/auth" ]] && [[ -n "$(ls -A "$HOME_DIR/auth" 2>/dev/null)" ]]; then
+      local backup; backup="$HOME_DIR/auth.backup-$(date +%Y%m%d-%H%M%S)"
+      cp -R "$HOME_DIR/auth" "$backup"
+      ok "backup da credencial atual em $backup"
+    fi
     rm -rf "$HOME_DIR/auth"
     cmd_start
   fi

@@ -1214,7 +1214,7 @@
     $('repair-ok').addEventListener('click', function () {
       repair.close();
       apiFetch('/session/pair', { method: 'POST' }).then(function () {
-        toast('Sessão descartada. O QR aparece aqui em instantes.');
+        toast('Aparelho desvinculado. O QR aparece aqui em instantes.');
         setTimeout(refreshAll, 1500);
       }, function (err) { toast('Não deu para parear de novo: ' + err.message); });
     });

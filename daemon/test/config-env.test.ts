@@ -1,5 +1,5 @@
 /**
- * Variáveis novas da config (histórico, concorrência de mídia, retenção) e o chmod 700
+ * Variáveis novas da config (histórico, concorrência de mídia, retenção, nome do aparelho) e o chmod 700
  * da pasta de estado.
  */
 import { strict as assert } from 'node:assert';
@@ -17,6 +17,7 @@ const VARS = [
   'WA_RETENTION_MESSAGES_DAYS',
   'WA_RETENTION_MEDIA_DAYS',
   'WA_RETENTION_METRICS_DAYS',
+  'WA_DEVICE_NAME',
 ] as const;
 const saved = new Map<string, string | undefined>();
 let dir: string;
@@ -73,6 +74,17 @@ test('valor inválido falha o boot em vez de virar NaN', () => {
   process.env.WA_HISTORY_DAYS = '7';
   process.env.WA_MEDIA_CONCURRENCY = '0';
   assert.throws(() => loadConfig(), /WA_MEDIA_CONCURRENCY inválido/);
+});
+
+test('nome do aparelho: wa-bridge por padrão, aparado, e longo demais falha o boot', () => {
+  useHome('device');
+  assert.equal(loadConfig().deviceName, 'wa-bridge');
+  process.env.WA_DEVICE_NAME = '   ';
+  assert.equal(loadConfig().deviceName, 'wa-bridge', 'vazio cai no padrão');
+  process.env.WA_DEVICE_NAME = '  wa-bridge (Mac)  ';
+  assert.equal(loadConfig().deviceName, 'wa-bridge (Mac)');
+  process.env.WA_DEVICE_NAME = 'x'.repeat(41);
+  assert.throws(() => loadConfig(), /WA_DEVICE_NAME inválido/);
 });
 
 test('restrictStateDirs corrige pasta que já existia com 755', () => {

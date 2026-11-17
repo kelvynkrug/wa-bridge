@@ -120,6 +120,7 @@ Docker), vira aviso no log, nunca falha de boot.
 | `WA_DRAFT_TTL_MS` | `300000` | validade do confirm token (5 min) |
 | `WA_SENDS_PER_HOUR` | `10` | rate limit global de envios |
 | `WA_HISTORY_DAYS` | `7` | dias de histórico importados no pareamento (`0` desliga) |
+| `WA_DEVICE_NAME` | `wa-bridge` | nome em "Aparelhos conectados" no celular (até 40 caracteres); só vale no próximo pareamento |
 | `WA_MEDIA_CONCURRENCY` | `10` | teto de mídias processando ao mesmo tempo (cada whisper carrega o modelo) |
 | `WA_RETENTION_MESSAGES_DAYS` | `0` | mensagens (e a mídia delas) mais velhas saem do banco (`0`, o padrão, nunca apaga) |
 | `WA_RETENTION_MEDIA_DAYS` | `30` | arquivos de mídia saem do disco; a transcrição fica (`0` desliga) |
@@ -237,7 +238,7 @@ export class WhatsAppConnection {
   connect(): Promise<void>;
   close(): void;                            // desligamento: sem reconexão e SEM logout
   getSessionState(): SessionState;          // { state, me, qrDataUrl, since }
-  forcePair(): Promise<void>;               // derruba e gera QR novo
+  forcePair(): Promise<void>;               // logout do aparelho, apaga auth/ e gera QR novo
   onMessage(cb: (m: StoredMessage, raw: WAMessageContent) => void): void;
   sendText(chatJid: string, text: string, quoted?: WAMessage, mentions?: string[]): Promise<string>;
   sendMedia(chatJid: string, filePath: string, caption?: string,

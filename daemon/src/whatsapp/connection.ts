@@ -47,6 +47,9 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
 /** Validade do cache local de membros de grupo (`groupMetadata` tem rate limit). */
 const GROUP_PARTICIPANTS_TTL_MS = 3_600_000;
 
+/** Quanto o novo pareamento espera o WhatsApp confirmar o logout do aparelho antigo. */
+const LOGOUT_TIMEOUT_MS = 5_000;
+
 const DAY_MS = 86_400_000;
 
 /**
@@ -245,6 +248,8 @@ export interface WhatsAppConnectionDeps {
   home: string;
   /** Dias de histórico importados no pareamento; `0` desliga a importação. */
   historyDays: number;
+  /** Nome em "Aparelhos conectados" no celular; o WhatsApp só lê no pareamento. */
+  deviceName: string;
 }
 
 /** Conexão Baileys com o WhatsApp, única para todo o daemon. */
@@ -253,6 +258,7 @@ export class WhatsAppConnection {
   private readonly log: Logger;
   private readonly authDir: string;
   private readonly historyDays: number;
+  private readonly deviceName: string;
   /** Ligado por `close()`: a partir daí nenhuma reconexão é agendada. */
   private closed = false;
 
@@ -269,6 +275,7 @@ export class WhatsAppConnection {
     this.log = deps.log;
     this.authDir = join(deps.home, 'auth');
     this.historyDays = deps.historyDays;
+    this.deviceName = deps.deviceName;
   }
 
   /** Abre a conexão com o WhatsApp, restaurando credenciais salvas quando existirem. */
@@ -298,7 +305,10 @@ export class WhatsAppConnection {
         { level: this.log.level === 'debug' || this.log.level === 'trace' ? this.log.level : 'warn' },
       ),
       version,
-      browser: Browsers.macOS('Chrome'),
+      // O primeiro item vira o nome em "Aparelhos conectados" ("Google Chrome (wa-bridge)"),
+      // para não confundir com o WhatsApp Web do próprio usuário. O celular grava o nome no
+      // pareamento: trocar aqui só aparece depois de parear de novo.
+      browser: [this.deviceName, ...Browsers.macOS('Chrome').slice(1)] as [string, string, string],
       // O Baileys pede o conteúdo de uma mensagem já enviada quando o destinatário não
       // conseguiu decifrá-la e pede reenvio (e para decifrar voto de enquete). Devolver
       // `undefined` deixa a pessoa vendo "Aguardando mensagem" para sempre.
@@ -426,6 +436,40 @@ export class WhatsAppConnection {
       this.reconnectTimer = null;
     }
     this.retireSocket();
+  }
+
+  /**
+   * Aposenta o socket atual e faz `logout`, que tira este aparelho de "Aparelhos
+   * conectados" no celular. Sem isso, cada novo pareamento deixava o aparelho antigo na
+   * lista. Melhor esforço: sem conexão aberta o logout falha, e o aparelho antigo fica lá
+   * até ser removido à mão.
+   */
+  private async unlinkSocket(): Promise<void> {
+    const previous = this.socket;
+    // Antes do logout: o `close` que ele dispara chega com o socket já aposentado e é ignorado.
+    this.socket = null;
+    if (!previous) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        previous.logout(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('logout sem resposta')), LOGOUT_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (error) {
+      this.log.warn(
+        { error },
+        'não deu para desvincular o aparelho antigo; remova-o no celular em Aparelhos conectados',
+      );
+    } finally {
+      clearTimeout(timer);
+      try {
+        previous.end(undefined);
+      } catch (error) {
+        this.log.error({ error }, 'erro ao encerrar o socket anterior');
+      }
+    }
   }
 
   /** Desliga o socket atual sem que o `close` dele dispare reconexão (o handler o ignora). */
@@ -735,14 +779,17 @@ export class WhatsAppConnection {
     return this.sessionState;
   }
 
-  /** Encerra o socket, apaga as credenciais salvas e reconecta para gerar um QR novo. */
+  /**
+   * Desvincula o aparelho atual, apaga as credenciais salvas e reconecta para gerar um QR
+   * novo.
+   */
   async forcePair(): Promise<void> {
-    this.log.warn('forcePair: apagando credenciais e forçando novo pareamento');
+    this.log.warn('forcePair: desvinculando o aparelho atual e forçando novo pareamento');
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.retireSocket();
+    await this.unlinkSocket();
     await rm(this.authDir, { recursive: true, force: true });
     this.sessionState = { state: 'connecting', me: null, qrDataUrl: null, since: Date.now(), lastError: null };
     await this.connect();
