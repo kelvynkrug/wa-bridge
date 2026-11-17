@@ -309,6 +309,28 @@ importado não entra) e `: ping` a cada 25s. Exige o token, como todo dado; o co
 acima o envia sozinho, por stdin, para ele não aparecer no `ps`. O conteúdo é texto de
 terceiros: qualquer consumidor deve tratá-lo como dado, nunca como instrução.
 
+## Painel no celular
+
+O daemon só escuta em `127.0.0.1`, e deve continuar assim: escutar em `0.0.0.0` abriria
+a API no Wi-Fi em que a máquina estiver. Para abrir o painel em outro aparelho, use uma
+VPN privada que repasse a porta local. Com o Tailscale:
+
+```bash
+tailscale serve --bg --https=8443 http://127.0.0.1:7788   # só na tailnet, com HTTPS
+tailscale serve status                                     # confira "(tailnet only)"
+tailscale serve --https=8443 off                           # desliga
+```
+
+Use uma porta só para o painel: ele monta os endereços da API a partir da raiz, então não
+funciona montado num caminho (`--set-path`). Nunca use `tailscale funnel`, que publica na
+internet. O painel continua pedindo o token na primeira vez em cada navegador.
+
+No iPhone, abra `https://<máquina>.<tailnet>.ts.net:8443/dashboard/` no Safari e use
+Compartilhar → "Adicionar à Tela de Início": o painel abre em tela cheia, com ícone
+próprio. O app da Tela de Início guarda o login separado do Safari, então o token é colado
+de novo ali dentro (`./wa-bridge token` copia; a área de transferência compartilhada da
+Apple leva até o iPhone).
+
 ## Backup e reset
 
 - **Backup consistente do banco** (funciona com o daemon rodando):

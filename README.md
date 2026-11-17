@@ -54,7 +54,9 @@ O que vem junto:
 - **Painel** em `http://127.0.0.1:7788/dashboard/` (`./wa-bridge open`): sessão e QR de
   pareamento, envios usados na hora e horário de silêncio, rascunhos esperando aprovação
   (dá para descartar), envios em andamento (dá para cancelar), mensagens chegando ao vivo,
-  busca com ⌘K, métricas por agente e por tool, auditoria e a saúde da instalação.
+  busca com ⌘K, métricas por agente e por tool, auditoria e a saúde da instalação. No
+  iPhone, vira app na Tela de Início (acesso por VPN privada, ver
+  [`docs/OPERACAO.md`](docs/OPERACAO.md#painel-no-celular)).
 
 ## Instalar
 
