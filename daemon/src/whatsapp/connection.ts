@@ -20,6 +20,7 @@ import makeWASocket, {
   type WAMessageContent,
   type WAMessageKey,
   type WASocket,
+  type proto,
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import type { GroupParticipant, Logger, MessageType, SessionState, StoredMessage } from '../types.js';
@@ -61,6 +62,24 @@ type IngestSource = 'live' | 'offline' | 'history';
 /** Status, newsletter e listas de transmissão não são conversa: ficam fora do histórico. */
 function isBroadcastJid(jid: string): boolean {
   return jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter');
+}
+
+/**
+ * Decide se o Baileys baixa e processa uma notificação de histórico do celular.
+ *
+ * O padrão do Baileys 6.7.24 é processar só com `syncFullHistory`, que fica desligado
+ * aqui: sem esta função, todo o histórico era descartado em silêncio. Aceita só bloco que
+ * dá para baixar (`directPath`): os que o celular manda embutidos na mensagem (bootstrap,
+ * status, nomes) falham nesta versão com "Cannot derive from empty media key", e as
+ * mensagens vêm nos blocos `RECENT`. Também mantém o que o Baileys fazia ao conectar: a
+ * consulta dele, sem `directPath`, responde não e ele não segura os eventos esperando
+ * histórico.
+ */
+export function shouldImportHistory(
+  historyDays: number,
+  notification: proto.Message.IHistorySyncNotification,
+): boolean {
+  return historyDays > 0 && Boolean(notification.directPath);
 }
 
 /**
@@ -313,6 +332,7 @@ export class WhatsAppConnection {
       // conseguiu decifrá-la e pede reenvio (e para decifrar voto de enquete). Devolver
       // `undefined` deixa a pessoa vendo "Aguardando mensagem" para sempre.
       getMessage: async (key) => this.lookupMessageContent(key.id),
+      shouldSyncHistoryMessage: (notification) => shouldImportHistory(this.historyDays, notification),
     });
     this.socket = socket;
 

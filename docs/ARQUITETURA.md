@@ -267,7 +267,11 @@ Entrada de mensagens, por origem:
   lista de transmissão. Entra com `insertMessageIfNew`, **não** soma em não lidas, **não**
   dispara `onMessage` e não vai para o cache em memória. Também nomeia as conversas da
   janela. O WhatsApp só manda isso uma vez por pareamento: sessão que já estava pareada
-  só recebe o histórico pareando de novo.
+  só recebe o histórico pareando de novo. O Baileys 6.7.24 só baixa o histórico quando
+  `shouldSyncHistoryMessage` aceita (o padrão dele é `syncFullHistory`, desligado aqui), por
+  isso o socket recebe `shouldImportHistory`: aceita os blocos com `directPath` (os
+  `RECENT`, que trazem as mensagens) e recusa os embutidos na mensagem, que falham no
+  download desta versão.
 
 O timestamp pode vir como `Long`; a conversão usa o `toNumber` do Baileys (com
 `Number()` cru a mensagem ficava com a hora em que foi gravada).
