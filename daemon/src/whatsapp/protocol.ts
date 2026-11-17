@@ -29,3 +29,29 @@ export function isDeviceSyncProtocolType(type: unknown): boolean {
   if (typeof type === 'number') return IDS.has(type);
   return typeof type === 'string' && NAMES.has(type);
 }
+
+/**
+ * Tipos de `messageAssociation` em que o filho (`associatedChildMessage`) é só outra cópia
+ * de uma mídia que já chegou como mensagem própria: a versão HD de foto ou vídeo (dual
+ * upload) e a parte em vídeo de uma foto com movimento. A original, apontada em
+ * `parentMessageKey`, é a que vai para o banco e é baixada; gravada, a cópia virava uma
+ * linha `unknown` a mais na conversa (e uma não lida a mais).
+ *
+ * Números do enum `proto.MessageAssociation.AssociationType` (um teste confere). Álbum
+ * (`MEDIA_ALBUM`) fica de fora: cada foto do álbum chega como mensagem normal.
+ */
+export const MEDIA_COPY_ASSOCIATION_TYPES = {
+  HD_VIDEO_DUAL_UPLOAD: 5,
+  HD_IMAGE_DUAL_UPLOAD: 10,
+  MOTION_PHOTO: 12,
+  HEVC_VIDEO_DUAL_UPLOAD: 19,
+} as const;
+
+const COPY_NAMES = new Set<string>(Object.keys(MEDIA_COPY_ASSOCIATION_TYPES));
+const COPY_IDS = new Set<number>(Object.values(MEDIA_COPY_ASSOCIATION_TYPES));
+
+/** Verdadeiro se a associação (número do enum ou nome) for de cópia de mídia. */
+export function isMediaCopyAssociation(type: unknown): boolean {
+  if (typeof type === 'number') return COPY_IDS.has(type);
+  return typeof type === 'string' && COPY_NAMES.has(type);
+}

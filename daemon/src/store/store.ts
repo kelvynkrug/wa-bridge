@@ -4,7 +4,7 @@
  */
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { maskNumber } from '../config.js';
-import { DEVICE_SYNC_PROTOCOL_TYPES } from '../whatsapp/protocol.js';
+import { DEVICE_SYNC_PROTOCOL_TYPES, MEDIA_COPY_ASSOCIATION_TYPES } from '../whatsapp/protocol.js';
 import type {
   AuditAction,
   AuditEvent,
@@ -420,6 +420,7 @@ export class Store {
       () => this.migrateSearchIndex(),
       () => this.migrateDropDeviceSyncMessages(),
       () => this.migrateSendFirstContact(),
+      () => this.migrateDropRedundantMessages(),
     ];
     const row = this.db.prepare('PRAGMA user_version').get() as unknown as { user_version: number };
     for (let target = Number(row.user_version) + 1; target <= steps.length; target += 1) {
@@ -586,6 +587,31 @@ export class Store {
     const columns = this.db.prepare('PRAGMA table_info(sends)').all() as unknown as Array<{ name: string }>;
     if (columns.some((c) => c.name === 'first_contact')) return;
     this.db.exec('ALTER TABLE sends ADD COLUMN first_contact INTEGER NOT NULL DEFAULT 0');
+  }
+
+  /**
+   * Passo 5: apaga os cabeçalhos de álbum (`albumMessage`) e as cópias de mídia
+   * (`associatedChildMessage` de versão HD ou foto com movimento) que versões anteriores
+   * gravavam como `unknown`. A foto ou o vídeo de verdade de cada uma já está no banco como
+   * mensagem própria. `raw_json` inválido fica como está.
+   */
+  private migrateDropRedundantMessages(): void {
+    const copies: Array<string | number> = [
+      ...Object.keys(MEDIA_COPY_ASSOCIATION_TYPES),
+      ...Object.values(MEDIA_COPY_ASSOCIATION_TYPES),
+    ];
+    this.db
+      .prepare(
+        `DELETE FROM messages
+          WHERE type = 'unknown'
+            AND CASE WHEN json_valid(raw_json) THEN
+                  json_type(raw_json, '$.message.albumMessage') IS NOT NULL
+                  OR (json_type(raw_json, '$.message.associatedChildMessage') IS NOT NULL
+                      AND json_extract(raw_json, '$.message.messageContextInfo.messageAssociation.associationType')
+                          IN (${copies.map(() => '?').join(', ')}))
+                ELSE 0 END`,
+      )
+      .run(...copies);
   }
 
   /** Fecha o banco. Depois disto nenhum método do Store funciona. */

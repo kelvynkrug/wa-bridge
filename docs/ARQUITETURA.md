@@ -260,7 +260,10 @@ export class WhatsAppConnection {
 Entrada de mensagens, por origem. Em qualquer origem, `protocolMessage` de sincronização
 entre os aparelhos da conta (histórico, chaves, configurações; lista em
 `whatsapp/protocol.ts`) não vira mensagem: o celular manda isso na conversa do usuário com
-ele mesmo. Edição e "apagar para todos" não estão na lista.
+ele mesmo. Edição e "apagar para todos" não estão na lista. Também não viram mensagem o
+cabeçalho de álbum (`albumMessage`, só avisa quantas fotos vêm; cada foto chega como
+mensagem normal) e as cópias de mídia que chegam em `associatedChildMessage` (versão HD de
+foto ou vídeo e a parte em vídeo de foto com movimento): a original já está no banco.
 
 
 - **ao vivo** (`messages.upsert` com `notify`): `upsertMessage`, soma em não lidas,
@@ -633,6 +636,7 @@ passo já publicado.
 | 2 | `idx_messages_ts` + índice de busca FTS5 (abaixo), com `rebuild` do que já existia |
 | 3 | apaga as `unknown` que são `protocolMessage` de sincronização entre aparelhos, gravadas antes do filtro de entrada |
 | 4 | coluna `sends.first_contact` (idempotente), que o limite de conversas novas por dia conta |
+| 5 | apaga as `unknown` que são cabeçalho de álbum ou cópia de mídia (HD, foto com movimento), gravadas antes do filtro de entrada |
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);

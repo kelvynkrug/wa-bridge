@@ -24,7 +24,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import type { GroupParticipant, Logger, MessageType, NewChatQuota, SessionState, StoredMessage } from '../types.js';
 import type { Store } from '../store/store.js';
-import { isDeviceSyncProtocolType } from './protocol.js';
+import { isDeviceSyncProtocolType, isMediaCopyAssociation } from './protocol.js';
 
 /** Métricas mínimas exigidas pela assinatura do contrato (ver `obs/metrics.ts`). */
 export interface Metrics {
@@ -152,6 +152,17 @@ function unwrapMessage(message: WAMessageContent): WAMessageContent {
 /** Verdadeiro para mensagem de sincronização entre os aparelhos da conta (ver `protocol.ts`). */
 function isDeviceSyncMessage(message: WAMessageContent): boolean {
   return isDeviceSyncProtocolType(unwrapMessage(message).protocolMessage?.type);
+}
+
+/**
+ * Verdadeiro para mensagem sem conteúdo próprio: o cabeçalho de um álbum (`albumMessage`,
+ * que só avisa quantas fotos vêm; cada foto chega como mensagem normal) e a cópia de uma
+ * mídia que já chegou (versão HD, foto com movimento; ver `protocol.ts`).
+ */
+function isRedundantMessage(message: WAMessageContent): boolean {
+  if (message.albumMessage) return true;
+  if (!message.associatedChildMessage) return false;
+  return isMediaCopyAssociation(message.messageContextInfo?.messageAssociation?.associationType);
 }
 
 /** Verdadeiro se a mensagem (ainda embrulhada) for um envio `viewOnce`. */
@@ -794,7 +805,7 @@ export class WhatsAppConnection {
 
   /** Converte uma mensagem bruta do Baileys em `StoredMessage`. */
   private parseMessage(raw: WAMessage, remoteJid: string): StoredMessage | null {
-    if (!raw.message || isDeviceSyncMessage(raw.message)) return null;
+    if (!raw.message || isDeviceSyncMessage(raw.message) || isRedundantMessage(raw.message)) return null;
     const chatJid = normalizeJid(remoteJid);
     const fromMe = raw.key.fromMe ?? false;
     const senderJid = fromMe
