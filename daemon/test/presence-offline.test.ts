@@ -1,7 +1,7 @@
 /**
- * O celular só notifica enquanto nenhum aparelho vinculado está "em uso". Enviar, digitar,
- * reagir, editar, apagar e marcar como lido deixam o daemon em uso no servidor, então cada
- * uma dessas ações termina avisando `unavailable` de novo. Socket falso: nada sai para a rede.
+ * O celular só notifica enquanto nenhum aparelho vinculado está "em uso". O envio não mostra
+ * "digitando" nem assina presença, e enviar, reagir, editar, apagar e marcar como lido
+ * terminam avisando `unavailable` de novo. Socket e WhatsApp falsos: nada sai para a rede.
  */
 import { strict as assert } from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -9,6 +9,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import pino from 'pino';
+import type { Config } from '../src/config.js';
+import { Audit } from '../src/obs/audit.js';
+import { Metrics } from '../src/obs/metrics.js';
+import { SendGate } from '../src/send/gate.js';
 import { Store } from '../src/store/store.js';
 import { WhatsAppConnection } from '../src/whatsapp/connection.js';
 
@@ -66,12 +70,48 @@ after(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('digitando não muda a presença; parar de digitar avisa offline', async () => {
+test('envio não mostra digitando nem assina presença, e termina avisando offline', async () => {
+  const chamadas: string[] = [];
+  const fakeWa = {
+    getGroupParticipants: async () => [],
+    getNewChatQuota: () => null,
+    buildQuoted: () => undefined,
+    sendText: async (_jid: string, text: string) => {
+      chamadas.push(`texto ${text}`);
+      return `id-${chamadas.length}`;
+    },
+    markOffline: async () => {
+      chamadas.push('offline');
+    },
+  } as unknown as WhatsAppConnection;
+  const config = {
+    home: dir,
+    blocklistPath: join(dir, 'blocklist.json'),
+    quietHours: { startMinute: 0, endMinute: 0, raw: '00:00-00:00' },
+    sendMaxDelayMs: 1000,
+    draftTtlMs: 60_000,
+    sendsPerHour: 10,
+    sendsPerDay: 40,
+    newContactsPerDay: 3,
+    chatMinIntervalMs: 0,
+  } as Config;
+  const gate = new SendGate({
+    wa: fakeWa, store, log: pino({ level: 'silent' }), metrics: new Metrics(store), audit: new Audit(store), config,
+  });
+
+  const draft = await gate.draft({ to: ANA, text: 'oi, tudo bem?' });
+  const { sendId } = await gate.confirm(draft.confirmToken, 'teste', { acknowledge: draft.warnings });
+  for (let i = 0; i < 100 && store.getSend(sendId)?.stage !== 'done'; i++) await new Promise((r) => setTimeout(r, 50));
+  // Sem `setPresence` no WhatsApp falso: se o gate ainda mandasse "digitando", o envio falharia.
+  assert.equal(store.getSend(sendId)?.stage, 'done');
+  assert.deepEqual(chamadas, ['texto oi, tudo bem?', 'offline']);
+});
+
+test('markOffline manda unavailable, e a conexão não tem mais como assinar presença', async () => {
   calls.length = 0;
-  await wa.setPresence(ANA, 'composing');
-  assert.deepEqual(calls, [`composing ${ANA}`]);
-  await wa.setPresence(ANA, 'paused');
-  assert.deepEqual(calls, [`composing ${ANA}`, `paused ${ANA}`, 'unavailable']);
+  await wa.markOffline();
+  assert.deepEqual(calls, ['unavailable']);
+  assert.equal((wa as unknown as { setPresence?: unknown }).setPresence, undefined);
 });
 
 test('reagir, marcar como lido, editar e apagar terminam avisando offline', async () => {

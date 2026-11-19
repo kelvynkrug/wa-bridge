@@ -254,8 +254,7 @@ export class WhatsAppConnection {
             quoted?: WAMessage, mentions?: string[]): Promise<string>;
   getGroupParticipants(jid: string,
     opts?: { refresh?: boolean; maxAgeMs?: number }): Promise<GroupParticipant[]>;
-  setPresence(chatJid: string, p: 'composing' | 'paused'): Promise<void>;  // nunca available;
-                                            // paused termina com `unavailable`
+  markOffline(): Promise<void>;            // `unavailable` de novo; fim de todo envio
   markRead(chatJid: string): Promise<void>;
   react(chatJid: string, messageId: string, emoji: string): Promise<void>;
   editMessage(chatJid: string, messageId: string, text: string): Promise<void>;
@@ -519,15 +518,15 @@ aborto; não documente como proteção contra banimento):
 - leitura antes de começar: 1500–4000ms
 - digitação: ~5 chars/s, **jitter log-normal** (σ≈0.25), teto de 20000ms por bubble
 - pausa entre bubbles: 800–2500ms
-- `composing` reemitido a cada 8000ms (expira no WhatsApp)
-- `paused` entre bubbles, ao final e ao abortar. **Nunca `available`**: o socket sobe com
-  `markOnlineOnConnect: false` e o daemon nunca aparece online, porque um aparelho online
-  faz o celular parar de notificar
-- isso não basta sozinho: enviar e "digitar" deixam o aparelho em uso no servidor, e o
-  aviso da conexão só valia até a primeira ação. Por isso `setPresence(..., 'paused')`
-  (o fim de todo envio), `react`, `markRead`, `editMessage` e `deleteMessage` terminam
-  mandando `unavailable` de novo. Sem isso, depois do primeiro envio o celular ficava sem
-  notificação até o próximo restart
+- `composing` reemitido a cada 8000ms e `paused` entre bubbles, ao final e ao abortar,
+  pelo callback `presence`. **O gate passa um callback vazio**: o daemon não mostra
+  "digitando" nem assina a presença de ninguém (`presenceSubscribe`), e só o tempo do
+  plano vale
+- o motivo é o celular do usuário: um aparelho vinculado em uso faz o celular parar de
+  notificar. O socket sobe com `markOnlineOnConnect: false` (nunca `available`), mas
+  enviar com "digitando" e assinatura de presença deixava o aparelho em uso até o próximo
+  restart, mesmo mandando `unavailable` depois. Hoje todo envio termina com `markOffline`
+  (`unavailable` de novo), e `react`, `markRead`, `editMessage` e `deleteMessage` também
 - total limitado por `WA_SEND_MAX_DELAY_MS`; se o plano estourar, comprime
   proporcionalmente em vez de truncar texto
 - `shouldAbort()` é consultado antes de CADA bubble — é o que faz `wa_cancel` funcionar
